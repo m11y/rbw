@@ -223,9 +223,7 @@ mod tests {
 
     #[test]
     fn version_includes_protocol_revision() {
-        let crate_part = VERSION - PROTOCOL_REVISION;
-        assert_eq!(VERSION, crate_part + PROTOCOL_REVISION);
-        assert_ne!(VERSION, crate_part);
+        assert_eq!(VERSION % 1_000_000, PROTOCOL_REVISION);
     }
 
     #[test]

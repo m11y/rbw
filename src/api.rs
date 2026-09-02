@@ -1490,18 +1490,12 @@ impl Client {
             .json(&req)
             .send()
             .map_err(|source| Error::Reqwest { source })?;
-        match res.status() {
-            reqwest::StatusCode::OK => Ok(()),
-            reqwest::StatusCode::UNAUTHORIZED => {
-                Err(Error::RequestUnauthorized)
-            }
-            reqwest::StatusCode::CONFLICT => {
-                Err(Error::CipherRevisionConflict)
-            }
-            _ => Err(Error::RequestFailed {
-                status: res.status().as_u16(),
-            }),
+        let status = res.status();
+        if status == reqwest::StatusCode::OK {
+            return Ok(());
         }
+        let body = res.text().unwrap_or_default();
+        Err(cipher_write_error(status, &body))
     }
 
     pub fn remove(&self, access_token: &str, id: &str) -> Result<()> {
@@ -1802,4 +1796,60 @@ fn classify_login_error(error_res: &ConnectErrorRes, code: u16) -> Error {
 
     log::warn!("unexpected error received during login: {error_res:?}");
     Error::RequestFailed { status: code }
+}
+
+fn cipher_write_error(status: reqwest::StatusCode, body: &str) -> Error {
+    // Official Bitwarden throws BadRequestException ("out of date") → 400.
+    // Vaultwarden uses err!("... out of date.") → also 400. Some forks
+    // might still use 409. Matching the body is what surfaces
+    // CipherRevisionConflict; status 409 is kept as a belt.
+    if status == reqwest::StatusCode::CONFLICT
+        || is_stale_cipher_message(body)
+    {
+        Error::CipherRevisionConflict
+    } else if status == reqwest::StatusCode::UNAUTHORIZED {
+        Error::RequestUnauthorized
+    } else {
+        Error::RequestFailed {
+            status: status.as_u16(),
+        }
+    }
+}
+
+fn is_stale_cipher_message(body: &str) -> bool {
+    body.to_ascii_lowercase().contains("out of date")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn revision_conflict_from_official_and_vaultwarden_bodies() {
+        assert!(matches!(
+            cipher_write_error(
+                reqwest::StatusCode::BAD_REQUEST,
+                "The item cannot be saved because it is out of date. Please reload and try again.",
+            ),
+            Error::CipherRevisionConflict
+        ));
+        assert!(matches!(
+            cipher_write_error(
+                reqwest::StatusCode::BAD_REQUEST,
+                r#"{"message":"The client copy of this cipher is out of date."}"#,
+            ),
+            Error::CipherRevisionConflict
+        ));
+        assert!(matches!(
+            cipher_write_error(reqwest::StatusCode::CONFLICT, ""),
+            Error::CipherRevisionConflict
+        ));
+        assert!(matches!(
+            cipher_write_error(
+                reqwest::StatusCode::BAD_REQUEST,
+                "Name is required",
+            ),
+            Error::RequestFailed { status: 400 }
+        ));
+    }
 }

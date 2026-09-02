@@ -1227,17 +1227,27 @@ const HELP_NOTES: &str = r"
 # Lines with leading # will be ignored.
 ";
 
-const HELP_START: &str = "# --- rbw field help start ---";
-const HELP_END: &str = "# --- rbw field help end ---";
+fn unique_help_markers(current: &str) -> (String, String) {
+    use rand::distr::SampleString as _;
+    loop {
+        let nonce =
+            rand::distr::Alphanumeric.sample_string(&mut rand::rng(), 16);
+        let start = format!("# --- rbw field help start {nonce} ---");
+        let end = format!("# --- rbw field help end {nonce} ---");
+        if !current.contains(&start) && !current.contains(&end) {
+            return (start, end);
+        }
+    }
+}
 
-fn field_help(boolean: bool) -> String {
+fn field_help(boolean: bool, start: &str, end: &str) -> String {
     let body = if boolean {
         "# Enter true or false (nothing else).\n# Empty values are refused."
     } else {
         "# The content of this file will be stored as the custom field value.\n\
          # Empty values are refused."
     };
-    format!("\n{HELP_START}\n{body}\n{HELP_END}\n")
+    format!("\n{start}\n{body}\n{end}\n")
 }
 
 pub fn config_show() -> anyhow::Result<()> {
@@ -1782,27 +1792,23 @@ pub fn edit(
 ) -> anyhow::Result<()> {
     unlock()?;
 
-    let mut db = load_db()?;
-
     let desc = format!(
         "{}{}",
         username.map_or_else(String::new, |s| format!("{s}@")),
         name
     );
 
+    // Resolve the selector against a fresh vault. Finding by name/URI in
+    // the old cache and then refreshing *that ID* would edit the wrong
+    // cipher if the name had been moved to another item.
+    crate::actions::sync()?;
+    let mut db = load_db()?;
     let entry = find_db_entry(&db, name, username, folder, ignore_case)
         .with_context(|| format!("couldn't find entry for '{desc}'"))?;
-    // Bitwarden has no single-field PATCH. A full PUT from a stale cache
-    // overwrites password/notes and, on a 1.15.0 cache, sends
-    // serde-default favorite=false. Sync first so the snapshot matches
-    // the server; lastKnownRevisionDate then rejects races while the
-    // editor is open. Do not sync again until after PUT.
-    let entry = refresh_entry(&mut db, &entry.id)?;
     let decrypted = decrypt_cipher(&entry)?;
 
     if let Some(field_name) = field {
         edit_custom_field(&mut db, &entry, &decrypted, field_name)?;
-        crate::actions::sync()?;
         return Ok(());
     }
 
@@ -1899,22 +1905,7 @@ pub fn edit(
     };
 
     put_cipher(&mut db, &entry, &data, &fields, notes.as_deref(), &history)?;
-
-    crate::actions::sync()?;
     Ok(())
-}
-
-fn refresh_entry(
-    db: &mut rbw::db::Db,
-    id: &str,
-) -> anyhow::Result<rbw::db::Entry> {
-    crate::actions::sync()?;
-    *db = load_db()?;
-    db.entries
-        .iter()
-        .find(|entry| entry.id == id)
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("entry disappeared after sync"))
 }
 
 fn put_cipher(
@@ -1928,7 +1919,7 @@ fn put_cipher(
     let meta = entry.cipher_write_meta();
     let access_token = db.access_token.as_ref().unwrap();
     let refresh_token = db.refresh_token.as_ref().unwrap();
-    if let (Some(access_token), ()) = rbw::actions::edit(
+    let (new_token, ()) = rbw::actions::edit(
         access_token,
         refresh_token,
         &entry.id,
@@ -1940,10 +1931,21 @@ fn put_cipher(
         entry.folder_id.as_deref(),
         history,
         &meta,
-    )? {
-        db.access_token = Some(access_token);
-        save_db(db)?;
+    )?;
+    if let Some(new_token) = new_token {
+        db.access_token = Some(new_token);
     }
+    // Patch the local snapshot so `rbw get` sees the write without a
+    // second full-vault sync. The next edit syncs before resolving the
+    // selector, so a slightly stale revision_date is harmless.
+    if let Some(slot) = db.entries.iter_mut().find(|item| item.id == entry.id)
+    {
+        slot.data = data.clone();
+        slot.fields = fields.to_vec();
+        slot.notes = notes.map(str::to_string);
+        slot.history = history.to_vec();
+    }
+    save_db(db)?;
     Ok(())
 }
 
@@ -1989,28 +1991,6 @@ fn strip_trailing_newlines(s: &str) -> String {
     s.trim_end_matches(['\n', '\r']).to_string()
 }
 
-fn line_without_cr(line: &str) -> &str {
-    line.trim_end_matches('\r')
-}
-
-fn help_residue_lines() -> impl Iterator<Item = &'static str> {
-    [
-        HELP_START,
-        HELP_END,
-        "# The content of this file will be stored as the custom field value.",
-        "# Enter true or false (nothing else).",
-        "# Empty values are refused.",
-    ]
-    .into_iter()
-}
-
-fn contains_help_residue(text: &str) -> bool {
-    text.lines().any(|line| {
-        let line = line_without_cr(line);
-        help_residue_lines().any(|help| line == help)
-    })
-}
-
 fn marker_span_start(raw: &str, marker_at: usize) -> usize {
     if marker_at >= 2
         && raw.as_bytes()[marker_at - 2] == b'\r'
@@ -2024,18 +2004,21 @@ fn marker_span_start(raw: &str, marker_at: usize) -> usize {
     }
 }
 
-fn strip_help_block(raw: &str) -> anyhow::Result<String> {
-    // Explicit start/end markers so we can delete the stub without
-    // rewriting the user's newlines. Matching on help prose as a suffix
-    // either ate `#` lines or, when the suffix failed, saved the stub.
-    // Consume the newline *before* START (inserted with the stub) but
-    // leave the newline after END so following user lines stay separate.
-    let start = raw.find(HELP_START);
-    let end = raw.find(HELP_END);
-    let combined = match (start, end) {
+fn strip_help_block(
+    raw: &str,
+    start: &str,
+    end: &str,
+) -> anyhow::Result<String> {
+    // Per-edit random markers: a user value may already contain a
+    // previous help fence. find() would then delete from that fence to
+    // the appended END and silently truncate. The nonce is chosen not
+    // to appear in the current value.
+    let start_at = raw.find(start);
+    let end_at = raw.find(end);
+    let combined = match (start_at, end_at) {
         (Some(s), Some(e)) if e > s => {
             let from = marker_span_start(raw, s);
-            let to = e + HELP_END.len();
+            let to = e + end.len();
             format!("{}{}", &raw[..from], &raw[to..])
         }
         (None, None) => raw.to_string(),
@@ -2044,7 +2027,7 @@ fn strip_help_block(raw: &str) -> anyhow::Result<String> {
              or remove it entirely"
         ),
     };
-    if contains_help_residue(&combined) {
+    if combined.contains(start) || combined.contains(end) {
         anyhow::bail!(
             "editor output still contains the help text; \
              remove it or leave the help block intact"
@@ -2057,14 +2040,18 @@ fn read_custom_field_value(
     current: &str,
     ty: Option<rbw::api::FieldType>,
 ) -> anyhow::Result<String> {
-    let help = field_help(ty == Some(rbw::api::FieldType::Boolean));
+    let (start, end) = unique_help_markers(current);
+    let help =
+        field_help(ty == Some(rbw::api::FieldType::Boolean), &start, &end);
     let mut current = current.to_string();
     let mut attempts = 0_u8;
     loop {
         let (raw, source) = rbw::edit::edit_from(&current, &help)?;
         let value = match source {
             rbw::edit::Source::Pipe => strip_trailing_newlines(&raw),
-            rbw::edit::Source::Editor => strip_help_block(&raw)?,
+            rbw::edit::Source::Editor => {
+                strip_help_block(&raw, &start, &end)?
+            }
         };
         if value.is_empty() {
             anyhow::bail!("refusing to set an empty custom field value");
@@ -2122,23 +2109,79 @@ fn edit_custom_field(
 
     let current = field.value.clone().unwrap_or_default();
     let new_value = read_custom_field_value(&current, field.ty)?;
+    put_field_plaintext(db, entry, field_name, &new_value)
+}
+
+fn put_field_plaintext(
+    db: &mut rbw::db::Db,
+    entry: &rbw::db::Entry,
+    field_name: &str,
+    plaintext: &str,
+) -> anyhow::Result<()> {
+    let (data, fields, notes, history) =
+        encrypt_field_on_entry(entry, field_name, plaintext)?;
+    match put_cipher(db, entry, &data, &fields, notes.as_deref(), &history) {
+        Ok(()) => Ok(()),
+        Err(err)
+            if matches!(
+                err.downcast_ref::<rbw::error::Error>(),
+                Some(rbw::error::Error::CipherRevisionConflict)
+            ) =>
+        {
+            // Re-apply only the field on a fresh snapshot. Retrying the
+            // original full PUT would overwrite a password another client
+            // just saved.
+            crate::actions::sync()?;
+            *db = load_db()?;
+            let entry = db
+                .entries
+                .iter()
+                .find(|item| item.id == entry.id)
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("entry disappeared after conflict sync")
+                })?;
+            let (data, fields, notes, history) =
+                encrypt_field_on_entry(&entry, field_name, plaintext)?;
+            put_cipher(db, &entry, &data, &fields, notes.as_deref(), &history)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn encrypt_field_on_entry(
+    entry: &rbw::db::Entry,
+    field_name: &str,
+    plaintext: &str,
+) -> anyhow::Result<(
+    rbw::db::EntryData,
+    Vec<rbw::db::Field>,
+    Option<String>,
+    Vec<rbw::db::HistoryEntry>,
+)> {
+    let decrypted = decrypt_cipher(entry)?;
+    if matches!(decrypted.data, DecryptedData::SshKey { .. }) {
+        anyhow::bail!(
+            "custom field edits are not supported for SSH key entries"
+        );
+    }
+    let idx = find_custom_field_index(&decrypted.fields, field_name)?;
+    if decrypted.fields[idx].ty == Some(rbw::api::FieldType::Linked) {
+        anyhow::bail!("linked custom fields cannot be edited as values");
+    }
     let encrypted = crate::actions::encrypt(
-        &new_value,
+        plaintext,
         entry.key.as_deref(),
         entry.org_id.as_deref(),
     )?;
-
     let mut fields = entry.fields.clone();
     fields[idx].value = Some(encrypted);
-
-    put_cipher(
-        db,
-        entry,
-        &entry.data,
-        &fields,
-        entry.notes.as_deref(),
-        &entry.history,
-    )
+    Ok((
+        entry.data.clone(),
+        fields,
+        entry.notes.clone(),
+        entry.history.clone(),
+    ))
 }
 
 pub fn remove(
@@ -4524,27 +4567,53 @@ mod test {
 
     #[test]
     fn test_strip_help_block() {
-        let help = field_help(false);
+        let start = "# --- rbw field help start TESTNONCE ---";
+        let end = "# --- rbw field help end TESTNONCE ---";
+        let help = field_help(false, start, end);
         let contents = format!("value\n#keep{help}");
-        assert_eq!(strip_help_block(&contents).unwrap(), "value\n#keep");
+        assert_eq!(
+            strip_help_block(&contents, start, end).unwrap(),
+            "value\n#keep"
+        );
 
         let crlf = format!("value\r\n#keep{}", help.replace('\n', "\r\n"));
-        assert_eq!(strip_help_block(&crlf).unwrap(), "value\r\n#keep");
+        assert_eq!(
+            strip_help_block(&crlf, start, end).unwrap(),
+            "value\r\n#keep"
+        );
 
         let after = format!("value{help}# mine\n");
-        assert_eq!(strip_help_block(&after).unwrap(), "value\n# mine");
+        assert_eq!(
+            strip_help_block(&after, start, end).unwrap(),
+            "value\n# mine"
+        );
 
-        assert_eq!(strip_help_block(&help).unwrap(), "");
-        assert_eq!(strip_help_block("just-piped\n").unwrap(), "just-piped");
+        assert_eq!(strip_help_block(&help, start, end).unwrap(), "");
+        assert_eq!(
+            strip_help_block("just-piped\n", start, end).unwrap(),
+            "just-piped"
+        );
 
         let crlf_value = format!("a\r\nb{help}");
-        assert_eq!(strip_help_block(&crlf_value).unwrap(), "a\r\nb");
+        assert_eq!(
+            strip_help_block(&crlf_value, start, end).unwrap(),
+            "a\r\nb"
+        );
 
-        let leftover_end = format!("value\n{HELP_END}\n");
-        assert!(strip_help_block(&leftover_end).is_err());
-        let leftover_body =
-            "value\n# Empty values are refused.\n".to_string();
-        assert!(strip_help_block(&leftover_body).is_err());
+        let stale = "# --- rbw field help start OLDNONCE ---";
+        let with_stale = format!("keep {stale} keep{help}");
+        assert_eq!(
+            strip_help_block(&with_stale, start, end).unwrap(),
+            format!("keep {stale} keep")
+        );
+
+        assert!(
+            strip_help_block(&format!("value\n{end}\n"), start, end).is_err()
+        );
+        assert!(strip_help_block(&format!("value\n{start}\n"), start, end)
+            .is_err());
+        let end_before_start = format!("value\n{end}\n{start}\n");
+        assert!(strip_help_block(&end_before_start, start, end).is_err());
     }
 
     #[test]
