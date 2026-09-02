@@ -1230,7 +1230,7 @@ const HELP_NOTES: &str = r"
 
 const HELP_FIELD: &str = r"
 # The content of this file will be stored as the custom field value.
-# Lines with leading # will be ignored.
+# This help text is not saved.
 ";
 
 pub fn config_show() -> anyhow::Result<()> {
@@ -1575,26 +1575,26 @@ pub fn add(
     let mut access_token = db.access_token.as_ref().unwrap().clone();
     let refresh_token = db.refresh_token.as_ref().unwrap();
 
-    let name = crate::actions::encrypt(name, None)?;
+    let name = crate::actions::encrypt(name, None, None)?;
 
     let username = username
-        .map(|username| crate::actions::encrypt(username, None))
+        .map(|username| crate::actions::encrypt(username, None, None))
         .transpose()?;
 
     let contents = rbw::edit::edit("", HELP_PW)?;
 
     let (password, notes) = parse_editor(&contents);
     let password = password
-        .map(|password| crate::actions::encrypt(&password, None))
+        .map(|password| crate::actions::encrypt(&password, None, None))
         .transpose()?;
     let notes = notes
-        .map(|notes| crate::actions::encrypt(&notes, None))
+        .map(|notes| crate::actions::encrypt(&notes, None, None))
         .transpose()?;
     let uris: Vec<_> = uris
         .iter()
         .map(|uri| {
             Ok(rbw::db::Uri {
-                uri: crate::actions::encrypt(&uri.0, None)?,
+                uri: crate::actions::encrypt(&uri.0, None, None)?,
                 match_type: uri.1,
             })
         })
@@ -1627,7 +1627,7 @@ pub fn add(
             let (new_access_token, id) = rbw::actions::create_folder(
                 &access_token,
                 refresh_token,
-                &crate::actions::encrypt(folder_name, None)?,
+                &crate::actions::encrypt(folder_name, None, None)?,
             )?;
             if let Some(new_access_token) = new_access_token {
                 access_token.clone_from(&new_access_token);
@@ -1680,16 +1680,16 @@ pub fn generate(
         let mut access_token = db.access_token.as_ref().unwrap().clone();
         let refresh_token = db.refresh_token.as_ref().unwrap();
 
-        let name = crate::actions::encrypt(name, None)?;
+        let name = crate::actions::encrypt(name, None, None)?;
         let username = username
-            .map(|username| crate::actions::encrypt(username, None))
+            .map(|username| crate::actions::encrypt(username, None, None))
             .transpose()?;
-        let password = crate::actions::encrypt(&password, None)?;
+        let password = crate::actions::encrypt(&password, None, None)?;
         let uris: Vec<_> = uris
             .iter()
             .map(|uri| {
                 Ok(rbw::db::Uri {
-                    uri: crate::actions::encrypt(&uri.0, None)?,
+                    uri: crate::actions::encrypt(&uri.0, None, None)?,
                     match_type: uri.1,
                 })
             })
@@ -1722,7 +1722,7 @@ pub fn generate(
                 let (new_access_token, id) = rbw::actions::create_folder(
                     &access_token,
                     refresh_token,
-                    &crate::actions::encrypt(folder_name, None)?,
+                    &crate::actions::encrypt(folder_name, None, None)?,
                 )?;
                 if let Some(new_access_token) = new_access_token {
                     access_token.clone_from(&new_access_token);
@@ -1801,13 +1801,18 @@ pub fn edit(
                 .map(|password| {
                     crate::actions::encrypt(
                         &password,
+                        entry.key.as_deref(),
                         entry.org_id.as_deref(),
                     )
                 })
                 .transpose()?;
             let notes = notes
                 .map(|notes| {
-                    crate::actions::encrypt(&notes, entry.org_id.as_deref())
+                    crate::actions::encrypt(
+                        &notes,
+                        entry.key.as_deref(),
+                        entry.org_id.as_deref(),
+                    )
                 })
                 .transpose()?;
             let mut history = entry.history.clone();
@@ -1856,7 +1861,11 @@ pub fn edit(
 
             let notes = notes
                 .map(|notes| {
-                    crate::actions::encrypt(&notes, entry.org_id.as_deref())
+                    crate::actions::encrypt(
+                        &notes,
+                        entry.key.as_deref(),
+                        entry.org_id.as_deref(),
+                    )
                 })
                 .transpose()?;
 
@@ -1880,6 +1889,7 @@ pub fn edit(
         notes.as_deref(),
         entry.folder_id.as_deref(),
         &history,
+        entry.key.as_deref(),
     )? {
         db.access_token = Some(access_token);
         save_db(&db)?;
@@ -1931,11 +1941,21 @@ fn strip_trailing_newlines(s: &str) -> String {
     s.trim_end_matches(['\n', '\r']).to_string()
 }
 
-fn strip_comment_lines(s: &str) -> String {
-    s.lines()
-        .filter(|line| !line.starts_with('#'))
-        .collect::<Vec<_>>()
-        .join("\n")
+fn strip_appended_help(raw: &str, help: &str) -> String {
+    let help_trim = help.trim_end_matches(['\n', '\r']);
+    let mut s = raw;
+    if let Some(prefix) = s.strip_suffix(help) {
+        s = prefix;
+    } else if let Some(without_nl) = s.strip_suffix('\n') {
+        if let Some(prefix) = without_nl.strip_suffix(help) {
+            s = prefix;
+        } else if let Some(prefix) = without_nl.strip_suffix(help_trim) {
+            s = prefix;
+        }
+    } else if let Some(prefix) = s.strip_suffix(help_trim) {
+        s = prefix;
+    }
+    strip_trailing_newlines(s)
 }
 
 fn read_custom_field_value(current: &str) -> anyhow::Result<String> {
@@ -1944,12 +1964,30 @@ fn read_custom_field_value(current: &str) -> anyhow::Result<String> {
     let value = if piped {
         strip_trailing_newlines(&raw)
     } else {
-        strip_trailing_newlines(&strip_comment_lines(&raw))
+        strip_appended_help(&raw, HELP_FIELD)
     };
     if value.is_empty() {
         anyhow::bail!("refusing to set an empty custom field value");
     }
     Ok(value)
+}
+
+fn validate_custom_field_value(
+    ty: Option<rbw::api::FieldType>,
+    value: &str,
+) -> anyhow::Result<()> {
+    match ty {
+        Some(rbw::api::FieldType::Linked) => {
+            anyhow::bail!("linked custom fields cannot be edited as values")
+        }
+        Some(rbw::api::FieldType::Boolean) => {
+            if value != "true" && value != "false" {
+                anyhow::bail!("boolean custom fields must be true or false");
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 fn edit_custom_field(
@@ -1958,11 +1996,26 @@ fn edit_custom_field(
     decrypted: &DecryptedCipher,
     field_name: &str,
 ) -> anyhow::Result<()> {
+    if matches!(decrypted.data, DecryptedData::SshKey { .. }) {
+        anyhow::bail!(
+            "custom field edits are not supported for SSH key entries"
+        );
+    }
+
     let idx = find_custom_field_index(&decrypted.fields, field_name)?;
-    let current = decrypted.fields[idx].value.clone().unwrap_or_default();
+    let field = &decrypted.fields[idx];
+    if field.ty == Some(rbw::api::FieldType::Linked) {
+        anyhow::bail!("linked custom fields cannot be edited as values");
+    }
+
+    let current = field.value.clone().unwrap_or_default();
     let new_value = read_custom_field_value(&current)?;
-    let encrypted =
-        crate::actions::encrypt(&new_value, entry.org_id.as_deref())?;
+    validate_custom_field_value(field.ty, &new_value)?;
+    let encrypted = crate::actions::encrypt(
+        &new_value,
+        entry.key.as_deref(),
+        entry.org_id.as_deref(),
+    )?;
 
     let mut fields = entry.fields.clone();
     fields[idx].value = Some(encrypted);
@@ -1980,6 +2033,7 @@ fn edit_custom_field(
         entry.notes.as_deref(),
         entry.folder_id.as_deref(),
         &entry.history,
+        entry.key.as_deref(),
     )? {
         db.access_token = Some(access_token);
         save_db(db)?;
@@ -4332,8 +4386,49 @@ mod test {
     }
 
     #[test]
-    fn test_strip_comment_lines() {
-        assert_eq!(strip_comment_lines("secret\n# ignored\n"), "secret");
-        assert_eq!(strip_comment_lines("# only comments\n"), "");
+    fn test_strip_appended_help_keeps_user_hash_lines() {
+        let contents = format!("value\n#keep{HELP_FIELD}");
+        assert_eq!(
+            strip_appended_help(&contents, HELP_FIELD),
+            "value\n#keep"
+        );
+        let with_extra_nl = format!("value\n#keep{HELP_FIELD}\n");
+        assert_eq!(
+            strip_appended_help(&with_extra_nl, HELP_FIELD),
+            "value\n#keep"
+        );
+        assert_eq!(
+            strip_appended_help("just-piped\n", HELP_FIELD),
+            "just-piped"
+        );
+    }
+
+    #[test]
+    fn test_validate_custom_field_value() {
+        assert!(validate_custom_field_value(
+            Some(rbw::api::FieldType::Hidden),
+            "any"
+        )
+        .is_ok());
+        assert!(validate_custom_field_value(
+            Some(rbw::api::FieldType::Boolean),
+            "true"
+        )
+        .is_ok());
+        assert!(validate_custom_field_value(
+            Some(rbw::api::FieldType::Boolean),
+            "false"
+        )
+        .is_ok());
+        assert!(validate_custom_field_value(
+            Some(rbw::api::FieldType::Boolean),
+            "yes"
+        )
+        .is_err());
+        assert!(validate_custom_field_value(
+            Some(rbw::api::FieldType::Linked),
+            "anything"
+        )
+        .is_err());
     }
 }
