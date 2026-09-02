@@ -1,7 +1,6 @@
 use std::{fmt::Write as _, io::Write as _, os::unix::ffi::OsStrExt as _};
 
 use anyhow::Context as _;
-use is_terminal::IsTerminal as _;
 
 // The default number of seconds the generated TOTP
 // code lasts for before a new one must be generated
@@ -995,6 +994,14 @@ impl DecryptedCipher {
         }
     }
 
+    fn display_custom_fields_list(&self) {
+        for f in &self.fields {
+            if let Some(name) = &f.name {
+                println!("{name}");
+            }
+        }
+    }
+
     fn display_json(&self, desc: &str) -> anyhow::Result<()> {
         serde_json::to_writer_pretty(std::io::stdout(), &self)
             .context(format!("failed to write entry '{desc}' to stdout"))?;
@@ -1231,6 +1238,7 @@ const HELP_NOTES: &str = r"
 const HELP_FIELD: &str = r"
 # The content of this file will be stored as the custom field value.
 # This help text is not saved.
+# Empty values are refused.
 ";
 
 pub fn config_show() -> anyhow::Result<()> {
@@ -1400,6 +1408,7 @@ pub fn get(
     clipboard: bool,
     ignore_case: bool,
     list_fields: bool,
+    list_custom_fields: bool,
 ) -> anyhow::Result<()> {
     unlock()?;
 
@@ -1414,7 +1423,9 @@ pub fn get(
     let (_, decrypted) =
         find_entry(&db, needle, user, folder, ignore_case)
             .with_context(|| format!("couldn't find entry for '{desc}'"))?;
-    if list_fields {
+    if list_custom_fields {
+        decrypted.display_custom_fields_list();
+    } else if list_fields {
         decrypted.display_fields_list();
     } else if raw {
         decrypted.display_json(&desc)?;
@@ -1959,12 +1970,10 @@ fn strip_appended_help(raw: &str, help: &str) -> String {
 }
 
 fn read_custom_field_value(current: &str) -> anyhow::Result<String> {
-    let piped = !std::io::stdin().is_terminal();
-    let raw = rbw::edit::edit(current, HELP_FIELD)?;
-    let value = if piped {
-        strip_trailing_newlines(&raw)
-    } else {
-        strip_appended_help(&raw, HELP_FIELD)
+    let (raw, source) = rbw::edit::edit_from(current, HELP_FIELD)?;
+    let value = match source {
+        rbw::edit::Source::Pipe => strip_trailing_newlines(&raw),
+        rbw::edit::Source::Editor => strip_appended_help(&raw, HELP_FIELD),
     };
     if value.is_empty() {
         anyhow::bail!("refusing to set an empty custom field value");

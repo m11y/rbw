@@ -84,6 +84,8 @@ enum Opt {
         clipboard: bool,
         #[structopt(short, long, help = "List fields in this entry")]
         list_fields: bool,
+        #[arg(long, help = "List custom fields in this entry")]
+        list_custom_fields: bool,
     },
 
     #[command(about = "Search for entries")]
@@ -207,8 +209,10 @@ enum Opt {
             as a note.\n\n\
             Pass --field to change a custom field instead of the \
             password and notes. Piped stdin is stored as the new value \
-            (a trailing newline is stripped); an interactive terminal \
-            opens the editor. The named custom field must already exist."
+            (trailing newlines are stripped); an interactive terminal \
+            opens the editor. The named custom field must already exist. \
+            Empty values are refused. SSH key entries and linked fields \
+            cannot be edited this way."
     )]
     Edit {
         #[command(flatten)]
@@ -356,6 +360,7 @@ fn main() {
             #[cfg(feature = "clipboard")]
             clipboard,
             list_fields,
+            list_custom_fields,
         } => commands::get(
             find_args.needle.clone(),
             find_args.user.as_deref(),
@@ -369,6 +374,7 @@ fn main() {
             false,
             find_args.ignorecase,
             list_fields,
+            list_custom_fields,
         ),
         Opt::Search {
             term,
