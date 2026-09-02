@@ -19,10 +19,10 @@
   and preserves `key` on the cipher PUT, so keyed items are not corrupted
   (#364, #368).
 * Cipher PUT now sends `reprompt`, `favorite`, `archivedDate`, and
-  `lastKnownRevisionDate`. `rbw edit` syncs once before resolving the
-  name/URI selector, then writes the local snapshot after PUT (no
-  second full sync). Stale-cipher responses (HTTP 400 "out of date" or
-  409) map to a retryable conflict error.
+  `lastKnownRevisionDate`. `rbw edit` syncs before resolving the
+  name/URI selector, and again after a successful PUT so the agent
+  rebuilds its master-password-reprompt set. Stale-cipher responses
+  (HTTP 400 "out of date" or 409) map to a retryable conflict error.
 
 ## [1.15.0] - 2025-12-31
 

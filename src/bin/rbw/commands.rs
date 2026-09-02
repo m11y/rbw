@@ -1240,14 +1240,22 @@ fn unique_help_markers(current: &str) -> (String, String) {
     }
 }
 
-fn field_help(boolean: bool, start: &str, end: &str) -> String {
-    let body = if boolean {
-        "# Enter true or false (nothing else).\n# Empty values are refused."
+const HELP_BODY: &str =
+    "# The content of this file will be stored as the custom field value.\n\
+     # Empty values are refused.";
+const HELP_BODY_BOOLEAN: &str =
+    "# Enter true or false (nothing else).\n# Empty values are refused.";
+
+fn help_body(boolean: bool) -> &'static str {
+    if boolean {
+        HELP_BODY_BOOLEAN
     } else {
-        "# The content of this file will be stored as the custom field value.\n\
-         # Empty values are refused."
-    };
-    format!("\n{start}\n{body}\n{end}\n")
+        HELP_BODY
+    }
+}
+
+fn field_help(boolean: bool, start: &str, end: &str) -> String {
+    format!("\n{start}\n{}\n{end}\n", help_body(boolean))
 }
 
 pub fn config_show() -> anyhow::Result<()> {
@@ -1805,14 +1813,18 @@ pub fn edit(
     let mut db = load_db()?;
     let entry = find_db_entry(&db, name, username, folder, ignore_case)
         .with_context(|| format!("couldn't find entry for '{desc}'"))?;
-    let decrypted = decrypt_cipher(&entry)?;
 
     if let Some(field_name) = field {
-        edit_custom_field(&mut db, &entry, &decrypted, field_name)?;
+        // Decrypt only the target field. Full decrypt_cipher would pinentry
+        // once per hidden value, and encrypt_field_on_entry used to do it
+        // a second time.
+        edit_custom_field(&mut db, &entry, field_name)?;
         return Ok(());
     }
 
-    let (data, fields, notes, history) = match &decrypted.data {
+    let decrypted = decrypt_cipher(&entry)?;
+
+    let (data, fields, notes, history, unsaved) = match &decrypted.data {
         DecryptedData::Login { password, .. } => {
             let mut contents =
                 format!("{}\n", password.as_deref().unwrap_or(""));
@@ -1821,7 +1833,7 @@ pub fn edit(
             }
 
             let contents = rbw::edit::edit(&contents, HELP_PW)?;
-
+            let unsaved = contents.clone();
             let (password, notes) = parse_editor(&contents);
             let password = password
                 .map(|password| {
@@ -1871,7 +1883,7 @@ pub fn edit(
                 uris: entry_uris.clone(),
                 totp: entry_totp.clone(),
             };
-            (data, entry.fields.clone(), notes, history)
+            (data, entry.fields.clone(), notes, history, unsaved)
         }
         DecryptedData::SecureNote => {
             let data = rbw::db::EntryData::SecureNote {};
@@ -1881,6 +1893,7 @@ pub fn edit(
                 |notes| format!("{notes}\n"),
             );
             let contents = rbw::edit::edit(&editor_content, HELP_NOTES)?;
+            let unsaved = contents.clone();
 
             // prepend blank line to be parsed as pw by `parse_editor`
             let (_, notes) = parse_editor(&format!("\n{contents}\n"));
@@ -1895,7 +1908,13 @@ pub fn edit(
                 })
                 .transpose()?;
 
-            (data, entry.fields.clone(), notes, entry.history.clone())
+            (
+                data,
+                entry.fields.clone(),
+                notes,
+                entry.history.clone(),
+                unsaved,
+            )
         }
         _ => {
             return Err(anyhow::anyhow!(
@@ -1904,8 +1923,43 @@ pub fn edit(
         }
     };
 
-    put_cipher(&mut db, &entry, &data, &fields, notes.as_deref(), &history)?;
+    if let Err(err) = put_cipher(
+        &mut db,
+        &entry,
+        &data,
+        &fields,
+        notes.as_deref(),
+        &history,
+    ) {
+        if is_revision_conflict(&err) {
+            let path = persist_unsaved_edit(&unsaved)?;
+            return Err(err).context(format!(
+                "unsaved edit written to {}",
+                path.display()
+            ));
+        }
+        return Err(err);
+    }
     Ok(())
+}
+
+fn is_revision_conflict(err: &anyhow::Error) -> bool {
+    matches!(
+        err.downcast_ref::<rbw::error::Error>(),
+        Some(rbw::error::Error::CipherRevisionConflict)
+    )
+}
+
+fn persist_unsaved_edit(buf: &str) -> anyhow::Result<std::path::PathBuf> {
+    use std::io::Write as _;
+    let mut tmp = tempfile::NamedTempFile::new()
+        .context("failed to create unsaved-edit tempfile")?;
+    tmp.write_all(buf.as_bytes())
+        .context("failed to write unsaved-edit tempfile")?;
+    let (_, path) = tmp.keep().map_err(|e| {
+        anyhow::anyhow!("failed to persist unsaved edit: {e}")
+    })?;
+    Ok(path)
 }
 
 fn put_cipher(
@@ -1934,18 +1988,13 @@ fn put_cipher(
     )?;
     if let Some(new_token) = new_token {
         db.access_token = Some(new_token);
+        save_db(db)?;
     }
-    // Patch the local snapshot so `rbw get` sees the write without a
-    // second full-vault sync. The next edit syncs before resolving the
-    // selector, so a slightly stale revision_date is harmless.
-    if let Some(slot) = db.entries.iter_mut().find(|item| item.id == entry.id)
-    {
-        slot.data = data.clone();
-        slot.fields = fields.to_vec();
-        slot.notes = notes.map(str::to_string);
-        slot.history = history.to_vec();
-    }
-    save_db(db)?;
+    // Agent rebuilds the master-password-reprompt ciphertext set only
+    // during sync. Patching the on-disk db is not enough: a following
+    // `rbw get` would decrypt the new hidden value without a prompt.
+    crate::actions::sync()?;
+    *db = load_db()?;
     Ok(())
 }
 
@@ -2027,13 +2076,27 @@ fn strip_help_block(
              or remove it entirely"
         ),
     };
-    if combined.contains(start) || combined.contains(end) {
+    if combined.contains(start)
+        || combined.contains(end)
+        || contains_help_body(&combined)
+    {
         anyhow::bail!(
             "editor output still contains the help text; \
              remove it or leave the help block intact"
         );
     }
     Ok(strip_trailing_newlines(&combined))
+}
+
+fn contains_help_body(text: &str) -> bool {
+    help_body(false)
+        .lines()
+        .chain(help_body(true).lines())
+        .filter(|line| !line.is_empty())
+        .any(|help_line| {
+            text.lines()
+                .any(|line| line.trim_end_matches('\r') == help_line)
+        })
 }
 
 fn read_custom_field_value(
@@ -2090,26 +2153,76 @@ fn validate_boolean_field(
 fn edit_custom_field(
     db: &mut rbw::db::Db,
     entry: &rbw::db::Entry,
-    decrypted: &DecryptedCipher,
     field_name: &str,
 ) -> anyhow::Result<()> {
     // Client::edit has no SSH key PUT payload (unreachable!). Login,
     // Secure Note, Card, and Identity all have typed PUT bodies.
-    if matches!(decrypted.data, DecryptedData::SshKey { .. }) {
+    if matches!(entry.data, rbw::db::EntryData::SshKey { .. }) {
         anyhow::bail!(
             "custom field edits are not supported for SSH key entries"
         );
     }
 
-    let idx = find_custom_field_index(&decrypted.fields, field_name)?;
-    let field = &decrypted.fields[idx];
-    if field.ty == Some(rbw::api::FieldType::Linked) {
+    let (idx, ty) = named_custom_field(entry, field_name)?;
+    if ty == Some(rbw::api::FieldType::Linked) {
         anyhow::bail!("linked custom fields cannot be edited as values");
     }
 
-    let current = field.value.clone().unwrap_or_default();
-    let new_value = read_custom_field_value(&current, field.ty)?;
-    put_field_plaintext(db, entry, field_name, &new_value)
+    let current = decrypt_custom_field_value(entry, idx)?;
+    let new_value = read_custom_field_value(&current, ty)?;
+    let original_ct = entry.fields[idx].value.clone();
+    put_field_plaintext(
+        db,
+        entry,
+        field_name,
+        &new_value,
+        original_ct.as_deref(),
+    )
+}
+
+fn named_custom_field(
+    entry: &rbw::db::Entry,
+    field_name: &str,
+) -> anyhow::Result<(usize, Option<rbw::api::FieldType>)> {
+    let mut decrypted_names = Vec::with_capacity(entry.fields.len());
+    for field in &entry.fields {
+        let name = field
+            .name
+            .as_ref()
+            .map(|name| {
+                crate::actions::decrypt(
+                    name,
+                    entry.key.as_deref(),
+                    entry.org_id.as_deref(),
+                )
+            })
+            .transpose()?;
+        decrypted_names.push(DecryptedField {
+            name,
+            value: None,
+            ty: field.ty,
+        });
+    }
+    let idx = find_custom_field_index(&decrypted_names, field_name)?;
+    Ok((idx, entry.fields[idx].ty))
+}
+
+fn decrypt_custom_field_value(
+    entry: &rbw::db::Entry,
+    idx: usize,
+) -> anyhow::Result<String> {
+    entry.fields[idx]
+        .value
+        .as_ref()
+        .map(|value| {
+            crate::actions::decrypt(
+                value,
+                entry.key.as_deref(),
+                entry.org_id.as_deref(),
+            )
+        })
+        .transpose()
+        .map(std::option::Option::unwrap_or_default)
 }
 
 fn put_field_plaintext(
@@ -2117,20 +2230,13 @@ fn put_field_plaintext(
     entry: &rbw::db::Entry,
     field_name: &str,
     plaintext: &str,
+    original_ciphertext: Option<&str>,
 ) -> anyhow::Result<()> {
     let (data, fields, notes, history) =
-        encrypt_field_on_entry(entry, field_name, plaintext)?;
+        encrypt_named_field(entry, field_name, plaintext)?;
     match put_cipher(db, entry, &data, &fields, notes.as_deref(), &history) {
         Ok(()) => Ok(()),
-        Err(err)
-            if matches!(
-                err.downcast_ref::<rbw::error::Error>(),
-                Some(rbw::error::Error::CipherRevisionConflict)
-            ) =>
-        {
-            // Re-apply only the field on a fresh snapshot. Retrying the
-            // original full PUT would overwrite a password another client
-            // just saved.
+        Err(err) if is_revision_conflict(&err) => {
             crate::actions::sync()?;
             *db = load_db()?;
             let entry = db
@@ -2141,15 +2247,24 @@ fn put_field_plaintext(
                 .ok_or_else(|| {
                     anyhow::anyhow!("entry disappeared after conflict sync")
                 })?;
+            let (idx, ty) = named_custom_field(&entry, field_name)?;
+            if entry.fields[idx].value.as_deref() != original_ciphertext {
+                // Another client changed this same field. Rebase would
+                // use the new revision and silently overwrite them.
+                return Err(err).context(
+                    "the same custom field was changed on the server",
+                );
+            }
+            validate_boolean_field(ty, plaintext)?;
             let (data, fields, notes, history) =
-                encrypt_field_on_entry(&entry, field_name, plaintext)?;
+                encrypt_named_field(&entry, field_name, plaintext)?;
             put_cipher(db, &entry, &data, &fields, notes.as_deref(), &history)
         }
         Err(err) => Err(err),
     }
 }
 
-fn encrypt_field_on_entry(
+fn encrypt_named_field(
     entry: &rbw::db::Entry,
     field_name: &str,
     plaintext: &str,
@@ -2159,14 +2274,8 @@ fn encrypt_field_on_entry(
     Option<String>,
     Vec<rbw::db::HistoryEntry>,
 )> {
-    let decrypted = decrypt_cipher(entry)?;
-    if matches!(decrypted.data, DecryptedData::SshKey { .. }) {
-        anyhow::bail!(
-            "custom field edits are not supported for SSH key entries"
-        );
-    }
-    let idx = find_custom_field_index(&decrypted.fields, field_name)?;
-    if decrypted.fields[idx].ty == Some(rbw::api::FieldType::Linked) {
+    let (idx, ty) = named_custom_field(entry, field_name)?;
+    if ty == Some(rbw::api::FieldType::Linked) {
         anyhow::bail!("linked custom fields cannot be edited as values");
     }
     let encrypted = crate::actions::encrypt(
@@ -4614,6 +4723,8 @@ mod test {
             .is_err());
         let end_before_start = format!("value\n{end}\n{start}\n");
         assert!(strip_help_block(&end_before_start, start, end).is_err());
+        let leftover_body = format!("value\n{HELP_BODY}\n");
+        assert!(strip_help_block(&leftover_body, start, end).is_err());
     }
 
     #[test]
