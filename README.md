@@ -131,12 +131,12 @@ field you want. The `--raw` flag will show the output as JSON. Run
 login, secure note, card, and identity entries. `rbw edit` syncs the
 vault before opening the editor, so it needs network access. Piped
 stdin is stored as the new value (trailing newlines are stripped), or an
-editor is opened when stdin is a terminal. Empty values are refused. SSH key entries and
-linked fields cannot be edited this way. `rbw get --list-custom-fields`
-lists the editable custom field names for an entry. In addition to
-matching against the name, you can pass a UUID as the name to search for
-the entry with that id, or a URL to search for an entry with a matching
-website entry.
+editor is opened when stdin is a terminal. Empty values are refused.
+SSH key entries and linked fields cannot be edited this way.
+`rbw get --list-custom-fields` lists the editable custom field names for
+an entry. In addition to matching against the name, you can pass a UUID
+as the name to search for the entry with that id, or a URL to search for
+an entry with a matching website entry.
 
 *Note to users of the official Bitwarden server (at bitwarden.com)*: The
 official server has a tendency to detect command line traffic as bot traffic
