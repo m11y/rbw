@@ -75,9 +75,21 @@ function __fish_rbw_edit_completion_fields
     argparse -i folder= f/field= i/ignorecase h/help -- $cmd
     set -e argv[1] # edit
 
-    if test (count $argv) -gt 0
-        command rbw get "$argv[1]" --list-custom-fields 2>/dev/null
+    if test (count $argv) -eq 0
+        return
     end
+    set -l get_args
+    if set -q _flag_folder
+        set -a get_args --folder $_flag_folder
+    end
+    if set -q _flag_ignorecase
+        set -a get_args --ignorecase
+    end
+    set -a get_args $argv[1]
+    if test (count $argv) -gt 1
+        set -a get_args $argv[2]
+    end
+    command rbw get $get_args --list-custom-fields 2>/dev/null
 end
 
 complete -f -c rbw -n '__fish_seen_subcommand_from get edit' -a '(__fish_rbw_get_completion_name)'

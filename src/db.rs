@@ -19,6 +19,14 @@ pub struct Entry {
     pub history: Vec<HistoryEntry>,
     pub key: Option<String>,
     pub master_password_reprompt: crate::api::CipherRepromptType,
+    // Official Bitwarden PUT maps omitted bool/enum/date fields to
+    // defaults (favorite=false, reprompt=None, archivedDate=null) via
+    // CipherRequestModel.ToCipherDetails(existingCipher). Persist what
+    // sync gave us so a field-only edit does not clobber them.
+    #[serde(default)]
+    pub favorite: bool,
+    #[serde(default)]
+    pub archived_date: Option<String>,
 }
 
 impl Entry {

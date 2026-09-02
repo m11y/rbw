@@ -4,17 +4,22 @@
 
 ## Added
 
-* `rbw edit --field=<name>` updates an existing custom field. Piped stdin
-  is stored as the new value; an interactive terminal opens the editor.
-  SSH key entries and linked fields are refused; boolean fields must be
-  `true` or `false`. Empty values are refused. The editor help text is
-  stripped as a suffix, not by dropping every `#` line (#370).
+* `rbw edit --field=<name>` updates an existing custom field on login,
+  secure note, card, and identity entries. Piped stdin is stored as the
+  new value; an interactive terminal opens the editor. SSH key entries
+  and linked fields are refused; boolean fields must be `true` or
+  `false`. Empty values are refused. The editor help block is removed by
+  content, not only as a suffix (#370).
+* `rbw get --list-custom-fields` lists editable custom field names
+  without decrypting hidden values (#370).
 
 ## Fixed
 
 * `rbw edit` encrypts with the entry's individual item key when present
   and preserves `key` on the cipher PUT, so keyed items are not corrupted
   (#364, #368).
+* Cipher PUT now sends `reprompt`, `favorite`, and `archivedDate` from
+  the last sync so a field-only edit does not reset them.
 
 ## [1.15.0] - 2025-12-31
 

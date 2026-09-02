@@ -127,13 +127,15 @@ Run `rbw get <name>` to get your passwords. If you also want to get the
 username or the note associated, you can use the flag `--full`. You can
 also use the flag `--field={field}` to get whatever default or custom
 field you want. The `--raw` flag will show the output as JSON. Run
-`rbw edit --field={field} <name>` to change an existing custom field:
-piped stdin is stored as the new value (trailing newlines are stripped),
-or an editor is opened when stdin is a terminal. Empty values are
-refused. SSH key entries and linked fields cannot be edited this way. In
-addition to matching against the name, you can pass a UUID as the name
-to search for the entry with that id, or a URL to search for an entry
-with a matching website entry.
+`rbw edit --field={field} <name>` to change an existing custom field on
+login, secure note, card, and identity entries: piped stdin is stored as
+the new value (trailing newlines are stripped), or an editor is opened
+when stdin is a terminal. Empty values are refused. SSH key entries and
+linked fields cannot be edited this way. `rbw get --list-custom-fields`
+lists the editable custom field names for an entry. In addition to
+matching against the name, you can pass a UUID as the name to search for
+the entry with that id, or a URL to search for an entry with a matching
+website entry.
 
 *Note to users of the official Bitwarden server (at bitwarden.com)*: The
 official server has a tendency to detect command line traffic as bot traffic

@@ -84,7 +84,11 @@ enum Opt {
         clipboard: bool,
         #[structopt(short, long, help = "List fields in this entry")]
         list_fields: bool,
-        #[arg(long, help = "List custom fields in this entry")]
+        #[arg(
+            long,
+            help = "List custom fields in this entry (not linked fields)",
+            conflicts_with = "list_fields"
+        )]
         list_custom_fields: bool,
     },
 
@@ -211,8 +215,9 @@ enum Opt {
             password and notes. Piped stdin is stored as the new value \
             (trailing newlines are stripped); an interactive terminal \
             opens the editor. The named custom field must already exist. \
-            Empty values are refused. SSH key entries and linked fields \
-            cannot be edited this way."
+            Empty values are refused. Login, secure note, card, and \
+            identity entries are supported; SSH key entries and linked \
+            fields cannot be edited this way."
     )]
     Edit {
         #[command(flatten)]

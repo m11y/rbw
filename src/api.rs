@@ -428,6 +428,10 @@ struct SyncResCipher {
     key: Option<String>,
     #[serde(rename = "Reprompt", alias = "reprompt")]
     reprompt: CipherRepromptType,
+    #[serde(default, rename = "Favorite", alias = "favorite")]
+    favorite: bool,
+    #[serde(default, rename = "ArchivedDate", alias = "archivedDate")]
+    archived_date: Option<String>,
 }
 
 impl SyncResCipher {
@@ -551,6 +555,8 @@ impl SyncResCipher {
             history,
             key: self.key.clone(),
             master_password_reprompt: self.reprompt,
+            favorite: self.favorite,
+            archived_date: self.archived_date.clone(),
         })
     }
 }
@@ -781,6 +787,12 @@ struct CiphersPutReq {
     #[serde(rename = "passwordHistory")]
     password_history: Vec<CiphersPutReqHistory>,
     key: Option<String>,
+    // Non-optional on the official server; omitting them resets the
+    // live cipher (see CipherRequestModel.ToCipherDetails).
+    reprompt: CipherRepromptType,
+    favorite: bool,
+    #[serde(rename = "archivedDate")]
+    archived_date: Option<String>,
 }
 
 #[derive(serde::Serialize, Debug)]
@@ -1330,6 +1342,9 @@ impl Client {
         folder_uuid: Option<&str>,
         history: &[crate::db::HistoryEntry],
         key: Option<&str>,
+        reprompt: CipherRepromptType,
+        favorite: bool,
+        archived_date: Option<&str>,
     ) -> Result<()> {
         let mut req = CiphersPutReq {
             ty: match data {
@@ -1364,6 +1379,10 @@ impl Client {
                 })
                 .collect(),
             key: key.map(std::string::ToString::to_string),
+            reprompt,
+            favorite,
+            archived_date: archived_date
+                .map(std::string::ToString::to_string),
         };
         match data {
             crate::db::EntryData::Login {

@@ -205,6 +205,9 @@ pub fn edit(
     folder_uuid: Option<&str>,
     history: &[crate::db::HistoryEntry],
     key: Option<&str>,
+    reprompt: crate::api::CipherRepromptType,
+    favorite: bool,
+    archived_date: Option<&str>,
 ) -> Result<(Option<String>, ())> {
     with_exchange_refresh_token(access_token, refresh_token, |access_token| {
         edit_once(
@@ -218,6 +221,9 @@ pub fn edit(
             folder_uuid,
             history,
             key,
+            reprompt,
+            favorite,
+            archived_date,
         )
     })
 }
@@ -233,6 +239,9 @@ fn edit_once(
     folder_uuid: Option<&str>,
     history: &[crate::db::HistoryEntry],
     key: Option<&str>,
+    reprompt: crate::api::CipherRepromptType,
+    favorite: bool,
+    archived_date: Option<&str>,
 ) -> Result<()> {
     let (client, _) = api_client()?;
     client.edit(
@@ -246,6 +255,9 @@ fn edit_once(
         folder_uuid,
         history,
         key,
+        reprompt,
+        favorite,
+        archived_date,
     )?;
     Ok(())
 }
