@@ -216,3 +216,54 @@ pub enum Response {
     Encrypt { cipherstring: String },
     Version { version: u32 },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_includes_protocol_revision() {
+        let crate_part = VERSION - PROTOCOL_REVISION;
+        assert_eq!(VERSION, crate_part + PROTOCOL_REVISION);
+        assert_ne!(VERSION, crate_part);
+    }
+
+    #[test]
+    fn encrypt_action_accepts_legacy_json_without_entry_key() {
+        let action: Action = serde_json::from_str(
+            r#"{"type":"Encrypt","plaintext":"p","org_id":null}"#,
+        )
+        .unwrap();
+        match action {
+            Action::Encrypt {
+                plaintext,
+                entry_key,
+                org_id,
+            } => {
+                assert_eq!(plaintext, "p");
+                assert!(entry_key.is_none());
+                assert!(org_id.is_none());
+            }
+            _ => panic!("expected Encrypt"),
+        }
+    }
+
+    #[test]
+    fn encrypt_action_roundtrips_entry_key() {
+        let action = Action::Encrypt {
+            plaintext: "p".into(),
+            entry_key: Some("k".into()),
+            org_id: None,
+        };
+        let json = serde_json::to_string(&action).unwrap();
+        assert!(json.contains("entry_key"));
+        let back: Action = serde_json::from_str(&json).unwrap();
+        match back {
+            Action::Encrypt {
+                entry_key: Some(key),
+                ..
+            } => assert_eq!(key, "k"),
+            other => panic!("expected Encrypt with key, got {other:?}"),
+        }
+    }
+}

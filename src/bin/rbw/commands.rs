@@ -1227,17 +1227,18 @@ const HELP_NOTES: &str = r"
 # Lines with leading # will be ignored.
 ";
 
-const HELP_FIELD: &str = r"
-# The content of this file will be stored as the custom field value.
-# This help text is not saved.
-# Empty values are refused.
-";
+const HELP_START: &str = "# --- rbw field help start ---";
+const HELP_END: &str = "# --- rbw field help end ---";
 
-const HELP_FIELD_BOOLEAN: &str = r"
-# Enter true or false (nothing else).
-# This help text is not saved.
-# Empty values are refused.
-";
+fn field_help(boolean: bool) -> String {
+    let body = if boolean {
+        "# Enter true or false (nothing else).\n# Empty values are refused."
+    } else {
+        "# The content of this file will be stored as the custom field value.\n\
+         # Empty values are refused."
+    };
+    format!("\n{HELP_START}\n{body}\n{HELP_END}\n")
+}
 
 pub fn config_show() -> anyhow::Result<()> {
     let config = rbw::config::Config::load()?;
@@ -1789,9 +1790,15 @@ pub fn edit(
         name
     );
 
-    let (entry, decrypted) =
-        find_entry(&db, name, username, folder, ignore_case)
-            .with_context(|| format!("couldn't find entry for '{desc}'"))?;
+    let entry = find_db_entry(&db, name, username, folder, ignore_case)
+        .with_context(|| format!("couldn't find entry for '{desc}'"))?;
+    // Bitwarden has no single-field PATCH. A full PUT from a stale cache
+    // overwrites password/notes and, on a 1.15.0 cache, sends
+    // serde-default favorite=false. Sync first so the snapshot matches
+    // the server; lastKnownRevisionDate then rejects races while the
+    // editor is open. Do not sync again until after PUT.
+    let entry = refresh_entry(&mut db, &entry.id)?;
+    let decrypted = decrypt_cipher(&entry)?;
 
     if let Some(field_name) = field {
         edit_custom_field(&mut db, &entry, &decrypted, field_name)?;
@@ -1897,6 +1904,19 @@ pub fn edit(
     Ok(())
 }
 
+fn refresh_entry(
+    db: &mut rbw::db::Db,
+    id: &str,
+) -> anyhow::Result<rbw::db::Entry> {
+    crate::actions::sync()?;
+    *db = load_db()?;
+    db.entries
+        .iter()
+        .find(|entry| entry.id == id)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("entry disappeared after sync"))
+}
+
 fn put_cipher(
     db: &mut rbw::db::Db,
     entry: &rbw::db::Entry,
@@ -1905,6 +1925,7 @@ fn put_cipher(
     notes: Option<&str>,
     history: &[rbw::db::HistoryEntry],
 ) -> anyhow::Result<()> {
+    let meta = entry.cipher_write_meta();
     let access_token = db.access_token.as_ref().unwrap();
     let refresh_token = db.refresh_token.as_ref().unwrap();
     if let (Some(access_token), ()) = rbw::actions::edit(
@@ -1918,10 +1939,7 @@ fn put_cipher(
         notes,
         entry.folder_id.as_deref(),
         history,
-        entry.key.as_deref(),
-        entry.master_password_reprompt,
-        entry.favorite,
-        entry.archived_date.as_deref(),
+        &meta,
     )? {
         db.access_token = Some(access_token);
         save_db(db)?;
@@ -1971,42 +1989,67 @@ fn strip_trailing_newlines(s: &str) -> String {
     s.trim_end_matches(['\n', '\r']).to_string()
 }
 
-fn normalize_newlines(s: &str) -> String {
-    s.replace("\r\n", "\n").replace('\r', "\n")
+fn line_without_cr(line: &str) -> &str {
+    line.trim_end_matches('\r')
 }
 
-fn strip_help_block(raw: &str, help: &str) -> anyhow::Result<String> {
-    // Locate the appended help by content, not only as a suffix: the user
-    // may add lines after it, an editor may rewrite LF as CRLF, or they
-    // may delete the value and leave only the help. Saving the help text
-    // as the secret is worse than refusing.
-    let raw_n = normalize_newlines(raw);
-    let help_trim = normalize_newlines(help).trim_matches('\n').to_string();
-    let Some(idx) = raw_n.rfind(&help_trim) else {
-        if let Some(first) = help_trim.lines().next() {
-            if !first.is_empty() && raw_n.contains(first) {
-                anyhow::bail!(
-                    "editor output still contains the help text; \
-                     remove it or leave the help block intact"
-                );
-            }
-        }
-        return Ok(strip_trailing_newlines(&raw_n));
-    };
-    let before = raw_n[..idx]
-        .strip_suffix('\n')
-        .unwrap_or_else(|| &raw_n[..idx]);
-    let after_i = idx + help_trim.len();
-    let after = raw_n[after_i..]
-        .strip_prefix('\n')
-        .unwrap_or_else(|| &raw_n[after_i..]);
-    let combined = if before.is_empty() {
-        after.to_string()
-    } else if after.is_empty() {
-        before.to_string()
+fn help_residue_lines() -> impl Iterator<Item = &'static str> {
+    [
+        HELP_START,
+        HELP_END,
+        "# The content of this file will be stored as the custom field value.",
+        "# Enter true or false (nothing else).",
+        "# Empty values are refused.",
+    ]
+    .into_iter()
+}
+
+fn contains_help_residue(text: &str) -> bool {
+    text.lines().any(|line| {
+        let line = line_without_cr(line);
+        help_residue_lines().any(|help| line == help)
+    })
+}
+
+fn marker_span_start(raw: &str, marker_at: usize) -> usize {
+    if marker_at >= 2
+        && raw.as_bytes()[marker_at - 2] == b'\r'
+        && raw.as_bytes()[marker_at - 1] == b'\n'
+    {
+        marker_at - 2
+    } else if marker_at >= 1 && raw.as_bytes()[marker_at - 1] == b'\n' {
+        marker_at - 1
     } else {
-        format!("{before}\n{after}")
+        marker_at
+    }
+}
+
+fn strip_help_block(raw: &str) -> anyhow::Result<String> {
+    // Explicit start/end markers so we can delete the stub without
+    // rewriting the user's newlines. Matching on help prose as a suffix
+    // either ate `#` lines or, when the suffix failed, saved the stub.
+    // Consume the newline *before* START (inserted with the stub) but
+    // leave the newline after END so following user lines stay separate.
+    let start = raw.find(HELP_START);
+    let end = raw.find(HELP_END);
+    let combined = match (start, end) {
+        (Some(s), Some(e)) if e > s => {
+            let from = marker_span_start(raw, s);
+            let to = e + HELP_END.len();
+            format!("{}{}", &raw[..from], &raw[to..])
+        }
+        (None, None) => raw.to_string(),
+        _ => anyhow::bail!(
+            "unbalanced help markers; leave the rbw help block intact \
+             or remove it entirely"
+        ),
     };
+    if contains_help_residue(&combined) {
+        anyhow::bail!(
+            "editor output still contains the help text; \
+             remove it or leave the help block intact"
+        );
+    }
     Ok(strip_trailing_newlines(&combined))
 }
 
@@ -2014,17 +2057,14 @@ fn read_custom_field_value(
     current: &str,
     ty: Option<rbw::api::FieldType>,
 ) -> anyhow::Result<String> {
-    let help = if ty == Some(rbw::api::FieldType::Boolean) {
-        HELP_FIELD_BOOLEAN
-    } else {
-        HELP_FIELD
-    };
+    let help = field_help(ty == Some(rbw::api::FieldType::Boolean));
     let mut current = current.to_string();
+    let mut attempts = 0_u8;
     loop {
-        let (raw, source) = rbw::edit::edit_from(&current, help)?;
+        let (raw, source) = rbw::edit::edit_from(&current, &help)?;
         let value = match source {
             rbw::edit::Source::Pipe => strip_trailing_newlines(&raw),
-            rbw::edit::Source::Editor => strip_help_block(&raw, help)?,
+            rbw::edit::Source::Editor => strip_help_block(&raw)?,
         };
         if value.is_empty() {
             anyhow::bail!("refusing to set an empty custom field value");
@@ -2032,6 +2072,13 @@ fn read_custom_field_value(
         match validate_boolean_field(ty, &value) {
             Ok(()) => return Ok(value),
             Err(e) if source == rbw::edit::Source::Editor => {
+                // Non-interactive $EDITOR that echoes the file (true,
+                // /bin/true) would loop forever if the stored value is
+                // already invalid.
+                attempts += 1;
+                if value == current || attempts >= 3 {
+                    return Err(e);
+                }
                 eprintln!("{e}; edit again");
                 current = value;
             }
@@ -2273,6 +2320,9 @@ fn find_db_entry(
 fn print_editable_custom_field_names(
     entry: &rbw::db::Entry,
 ) -> anyhow::Result<()> {
+    if matches!(entry.data, rbw::db::EntryData::SshKey { .. }) {
+        anyhow::bail!("SSH key entries have no editable custom fields");
+    }
     for field in &entry.fields {
         if field.ty == Some(rbw::api::FieldType::Linked) {
             continue;
@@ -4409,6 +4459,7 @@ mod test {
                 master_password_reprompt: rbw::api::CipherRepromptType::None,
                 favorite: false,
                 archived_date: None,
+                revision_date: None,
             },
             DecryptedSearchCipher {
                 id: id.to_string(),
@@ -4473,32 +4524,27 @@ mod test {
 
     #[test]
     fn test_strip_help_block() {
-        let contents = format!("value\n#keep{HELP_FIELD}");
-        assert_eq!(
-            strip_help_block(&contents, HELP_FIELD).unwrap(),
-            "value\n#keep"
-        );
-        let crlf =
-            format!("value\r\n#keep{}", HELP_FIELD.replace('\n', "\r\n"));
-        assert_eq!(
-            strip_help_block(&crlf, HELP_FIELD).unwrap(),
-            "value\n#keep"
-        );
-        let after = format!("value{HELP_FIELD}# mine\n");
-        assert_eq!(
-            strip_help_block(&after, HELP_FIELD).unwrap(),
-            "value\n# mine"
-        );
-        // User deleted the value line and left only the help: empty, so
-        // read_custom_field_value will refuse rather than save the stub.
-        assert_eq!(strip_help_block(HELP_FIELD, HELP_FIELD).unwrap(), "");
-        let leftover =
-            format!("value\n{}", HELP_FIELD.lines().nth(1).unwrap());
-        assert!(strip_help_block(&leftover, HELP_FIELD).is_err());
-        assert_eq!(
-            strip_help_block("just-piped\n", HELP_FIELD).unwrap(),
-            "just-piped"
-        );
+        let help = field_help(false);
+        let contents = format!("value\n#keep{help}");
+        assert_eq!(strip_help_block(&contents).unwrap(), "value\n#keep");
+
+        let crlf = format!("value\r\n#keep{}", help.replace('\n', "\r\n"));
+        assert_eq!(strip_help_block(&crlf).unwrap(), "value\r\n#keep");
+
+        let after = format!("value{help}# mine\n");
+        assert_eq!(strip_help_block(&after).unwrap(), "value\n# mine");
+
+        assert_eq!(strip_help_block(&help).unwrap(), "");
+        assert_eq!(strip_help_block("just-piped\n").unwrap(), "just-piped");
+
+        let crlf_value = format!("a\r\nb{help}");
+        assert_eq!(strip_help_block(&crlf_value).unwrap(), "a\r\nb");
+
+        let leftover_end = format!("value\n{HELP_END}\n");
+        assert!(strip_help_block(&leftover_end).is_err());
+        let leftover_body =
+            "value\n# Empty values are refused.\n".to_string();
+        assert!(strip_help_block(&leftover_body).is_err());
     }
 
     #[test]

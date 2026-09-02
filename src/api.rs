@@ -432,6 +432,8 @@ struct SyncResCipher {
     favorite: bool,
     #[serde(default, rename = "ArchivedDate", alias = "archivedDate")]
     archived_date: Option<String>,
+    #[serde(default, rename = "RevisionDate", alias = "revisionDate")]
+    revision_date: Option<String>,
 }
 
 impl SyncResCipher {
@@ -557,6 +559,7 @@ impl SyncResCipher {
             master_password_reprompt: self.reprompt,
             favorite: self.favorite,
             archived_date: self.archived_date.clone(),
+            revision_date: self.revision_date.clone(),
         })
     }
 }
@@ -793,6 +796,14 @@ struct CiphersPutReq {
     favorite: bool,
     #[serde(rename = "archivedDate")]
     archived_date: Option<String>,
+    // Official server only conflict-checks when this is present. An
+    // omitted value allows a stale full PUT to overwrite a password or
+    // notes another client just saved.
+    #[serde(
+        rename = "lastKnownRevisionDate",
+        skip_serializing_if = "Option::is_none"
+    )]
+    last_known_revision_date: Option<String>,
 }
 
 #[derive(serde::Serialize, Debug)]
@@ -1341,10 +1352,7 @@ impl Client {
         notes: Option<&str>,
         folder_uuid: Option<&str>,
         history: &[crate::db::HistoryEntry],
-        key: Option<&str>,
-        reprompt: CipherRepromptType,
-        favorite: bool,
-        archived_date: Option<&str>,
+        meta: &crate::db::CipherWriteMeta<'_>,
     ) -> Result<()> {
         let mut req = CiphersPutReq {
             ty: match data {
@@ -1378,10 +1386,14 @@ impl Client {
                     password: entry.password.clone(),
                 })
                 .collect(),
-            key: key.map(std::string::ToString::to_string),
-            reprompt,
-            favorite,
-            archived_date: archived_date
+            key: meta.key.map(std::string::ToString::to_string),
+            reprompt: meta.reprompt,
+            favorite: meta.favorite,
+            archived_date: meta
+                .archived_date
+                .map(std::string::ToString::to_string),
+            last_known_revision_date: meta
+                .last_known_revision_date
                 .map(std::string::ToString::to_string),
         };
         match data {
@@ -1482,6 +1494,9 @@ impl Client {
             reqwest::StatusCode::OK => Ok(()),
             reqwest::StatusCode::UNAUTHORIZED => {
                 Err(Error::RequestUnauthorized)
+            }
+            reqwest::StatusCode::CONFLICT => {
+                Err(Error::CipherRevisionConflict)
             }
             _ => Err(Error::RequestFailed {
                 status: res.status().as_u16(),

@@ -18,8 +18,10 @@
 * `rbw edit` encrypts with the entry's individual item key when present
   and preserves `key` on the cipher PUT, so keyed items are not corrupted
   (#364, #368).
-* Cipher PUT now sends `reprompt`, `favorite`, and `archivedDate` from
-  the last sync so a field-only edit does not reset them.
+* Cipher PUT now sends `reprompt`, `favorite`, `archivedDate`, and
+  `lastKnownRevisionDate`. Edits sync first so a stale cache cannot
+  overwrite another client's password or notes, or unfavorite an item
+  on the first edit after upgrade.
 
 ## [1.15.0] - 2025-12-31
 
