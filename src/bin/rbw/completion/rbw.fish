@@ -66,6 +66,8 @@ function __fish_rbw_get_completion_fields
 end
 
 complete -f -c rbw -n '__fish_seen_subcommand_from get edit' -a '(__fish_rbw_get_completion_name)'
+complete -f -c rbw -n '__fish_seen_subcommand_from edit' -s f -l field -r -d 'Custom field to edit' -a '(__fish_rbw_get_completion_fields)'
+complete -f -c rbw -n '__fish_seen_subcommand_from edit' -l folder -r -d 'Folder name to search in' -a '(command rbw list --fields folder)'
 
 # Complete options for `rbw get`
 complete -f -c rbw -n '__fish_seen_subcommand_from get' -s i -l ignorecase -d 'Ignore case'

@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+* `rbw edit --field=<name>` updates an existing custom field. Piped stdin
+  is stored as the new value; an interactive terminal opens the editor.
+  SSH key entries and linked fields are refused; boolean fields must be
+  `true` or `false`. The editor help text is stripped as a suffix, not by
+  dropping every `#` line.
+
+### Fixed
+
+* `rbw edit` encrypts with the entry's individual item key when present
+  and preserves `key` on the cipher PUT, so keyed items are not corrupted
+  (#364, #368).
+
 ## [1.15.0] - 2025-12-31
 
 ## Added
