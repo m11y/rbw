@@ -204,11 +204,21 @@ enum Opt {
             The editor to use is determined  by the value of the \
             $VISUAL or $EDITOR environment variables. The first line \
             will be saved as the password and the remainder will be saved \
-            as a note."
+            as a note.\n\n\
+            Pass --field to change a custom field instead of the \
+            password and notes. Piped stdin is stored as the new value \
+            (a trailing newline is stripped); an interactive terminal \
+            opens the editor. The named custom field must already exist."
     )]
     Edit {
         #[command(flatten)]
         find_args: FindArgs,
+        #[arg(
+            short,
+            long,
+            help = "Custom field to edit instead of password/notes"
+        )]
+        field: Option<String>,
     },
 
     #[command(about = "Remove a given entry", visible_alias = "rm")]
@@ -430,11 +440,12 @@ fn main() {
                 ty,
             )
         }
-        Opt::Edit { find_args } => commands::edit(
+        Opt::Edit { find_args, field } => commands::edit(
             find_args.needle,
             find_args.user.as_deref(),
             find_args.folder.as_deref(),
             find_args.ignorecase,
+            field.as_deref(),
         ),
         Opt::Remove { find_args } => commands::remove(
             find_args.needle,

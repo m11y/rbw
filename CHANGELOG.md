@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+* `rbw edit --field=<name>` updates an existing custom field. Piped stdin
+  is stored as the new value; an interactive terminal opens the editor.
+
 ## [1.15.0] - 2025-12-31
 
 ## Added

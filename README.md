@@ -126,7 +126,9 @@ functionality.
 Run `rbw get <name>` to get your passwords. If you also want to get the username
 or the note associated, you can use the flag `--full`. You can also use the flag
 `--field={field}` to get whatever default or custom field you want. The `--raw`
-flag will show the output as JSON. In addition to matching against the name,
+flag will show the output as JSON. Run `rbw edit --field={field} <name>` to
+change an existing custom field: piped stdin is stored as the new value, or
+an editor is opened when stdin is a terminal. In addition to matching against the name,
 you can pass a UUID as the name to search for the entry with that id, or a
 URL to search for an entry with a matching website entry.
 
