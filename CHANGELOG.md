@@ -36,7 +36,10 @@
   vault to disk before replacing that in-memory set; a refresh
   failure after a successful PUT is an error (`rbw sync`), not a
   silent success. Stale-cipher responses (HTTP 400 "out of date" or
-  409) map to a retryable conflict error.
+  409) map to a retryable conflict error. Field conflict retries
+  compare the target field's plaintext: official clients re-encrypt
+  every custom field on save, so a notes-only edit changes ciphertext
+  without changing the value.
 * A rejected *editor* edit keeps the plaintext in `$RBW
   runtime/unsaved-edits/` (directory mode 0700, files 0600,
   `O_EXCL`) until you delete it. Piped stdin is not written to disk.

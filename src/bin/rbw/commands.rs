@@ -2249,6 +2249,7 @@ fn edit_custom_field(
             field_name,
             &new_value,
             original_ct.as_deref(),
+            &current,
         ),
     )
 }
@@ -2298,12 +2299,32 @@ fn decrypt_custom_field_value(
         .map(std::option::Option::unwrap_or_default)
 }
 
+/// True when a concurrent save changed this field's plaintext.
+///
+/// Ciphertext inequality is not enough. Official Bitwarden clients
+/// encrypt `CipherView` from scratch on every save
+/// (`FieldView::encrypt_composite` always encrypts name+value). AES-CBC
+/// uses a random IV, so a notes-only edit rotates this field's
+/// ciphertext while leaving the value alone. rbw itself leaves
+/// untouched fields' ciphertext unchanged, so equal ciphertext is a
+/// decrypt-free fast path.
+fn target_field_plaintext_changed(
+    original_ciphertext: Option<&str>,
+    original_plaintext: &str,
+    server_ciphertext: Option<&str>,
+    server_plaintext: &str,
+) -> bool {
+    original_ciphertext != server_ciphertext
+        && original_plaintext != server_plaintext
+}
+
 fn put_field_plaintext(
     db: &mut rbw::db::Db,
     entry: &rbw::db::Entry,
     field_name: &str,
     plaintext: &str,
     original_ciphertext: Option<&str>,
+    original_plaintext: &str,
 ) -> anyhow::Result<()> {
     let (data, fields, notes, history) =
         encrypt_named_field(entry, field_name, plaintext)?;
@@ -2321,12 +2342,19 @@ fn put_field_plaintext(
                     anyhow::anyhow!("entry disappeared after conflict sync")
                 })?;
             let (idx, ty) = named_custom_field(&entry, field_name)?;
-            if entry.fields[idx].value.as_deref() != original_ciphertext {
-                // Another client changed this same field. Rebase would
-                // use the new revision and silently overwrite them.
-                return Err(err.context(
-                    "the same custom field was changed on the server",
-                ));
+            let server_ct = entry.fields[idx].value.as_deref();
+            if original_ciphertext != server_ct {
+                let server_pt = decrypt_custom_field_value(&entry, idx)?;
+                if target_field_plaintext_changed(
+                    original_ciphertext,
+                    original_plaintext,
+                    server_ct,
+                    &server_pt,
+                ) {
+                    return Err(err.context(
+                        "the same custom field was changed on the server",
+                    ));
+                }
             }
             validate_boolean_field(ty, plaintext)?;
             let (data, fields, notes, history) =
@@ -4851,6 +4879,24 @@ mod test {
             "anything"
         )
         .is_ok());
+    }
+
+    #[test]
+    fn test_target_field_plaintext_changed() {
+        let old_ct = Some("2.aaa");
+        let new_ct = Some("2.bbb");
+        assert!(!target_field_plaintext_changed(
+            old_ct, "token", old_ct, "token"
+        ));
+        // Official client re-encrypted the field in place.
+        assert!(!target_field_plaintext_changed(
+            old_ct, "token", new_ct, "token"
+        ));
+        assert!(target_field_plaintext_changed(
+            old_ct, "token", new_ct, "other"
+        ));
+        assert!(!target_field_plaintext_changed(None, "", None, ""));
+        assert!(target_field_plaintext_changed(None, "", new_ct, "other"));
     }
 
     #[test]
