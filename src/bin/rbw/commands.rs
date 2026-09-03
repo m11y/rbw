@@ -1608,9 +1608,9 @@ pub fn add(
     // unwrap is safe here because the call to unlock above is guaranteed to
     // populate these or error
 
-    let name = crate::actions::encrypt(name, None, None)?;
+    let encrypted_name = crate::actions::encrypt(name, None, None)?;
 
-    let username = username
+    let encrypted_username = username
         .map(|username| crate::actions::encrypt(username, None, None))
         .transpose()?;
 
@@ -1618,14 +1618,21 @@ pub fn add(
     after_editor(
         source,
         &contents,
-        add_after_editor(&mut db, &name, username, uris, folder, &contents),
+        add_after_editor(
+            &mut db,
+            &encrypted_name,
+            encrypted_username,
+            uris,
+            folder,
+            &contents,
+        ),
     )
 }
 
 fn add_after_editor(
     db: &mut rbw::db::Db,
-    name: &str,
-    username: Option<String>,
+    encrypted_name: &str,
+    encrypted_username: Option<String>,
     uris: &[(String, Option<rbw::api::UriMatchType>)],
     folder: Option<&str>,
     contents: &str,
@@ -1688,24 +1695,27 @@ fn add_after_editor(
         }
     }
 
-    if let (Some(access_token), ()) = rbw::actions::add(
+    let (new_token, ()) = rbw::actions::add(
         &access_token,
         &refresh_token,
-        name,
+        encrypted_name,
         &rbw::db::EntryData::Login {
-            username,
+            username: encrypted_username,
             password,
             uris,
             totp: None,
         },
         notes.as_deref(),
         folder_id.as_deref(),
-    )? {
-        db.access_token = Some(access_token);
-        save_db(db)?;
-    }
-
-    refresh_local_cache()
+    )?;
+    after_server_write(|| {
+        if let Some(new_token) = new_token {
+            db.access_token = Some(new_token);
+            save_db(db)?;
+        }
+        crate::actions::sync()?;
+        Ok(())
+    })
 }
 
 pub fn generate(
@@ -1781,7 +1791,7 @@ pub fn generate(
             }
         }
 
-        if let (Some(access_token), ()) = rbw::actions::add(
+        let (new_token, ()) = rbw::actions::add(
             &access_token,
             refresh_token,
             &name,
@@ -1793,12 +1803,15 @@ pub fn generate(
             },
             None,
             folder_id.as_deref(),
-        )? {
-            db.access_token = Some(access_token);
-            save_db(&db)?;
-        }
-
-        refresh_local_cache()?;
+        )?;
+        after_server_write(|| {
+            if let Some(new_token) = new_token {
+                db.access_token = Some(new_token);
+                save_db(&db)?;
+            }
+            crate::actions::sync()?;
+            Ok(())
+        })?;
     }
 
     Ok(())
@@ -2051,8 +2064,10 @@ impl std::fmt::Display for LocalCacheRefreshFailed {
 
 impl std::error::Error for LocalCacheRefreshFailed {}
 
-fn refresh_local_cache() -> anyhow::Result<()> {
-    crate::actions::sync().context(LocalCacheRefreshFailed)
+fn after_server_write<T>(
+    op: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    op().context(LocalCacheRefreshFailed)
 }
 
 fn is_local_cache_refresh_failed(err: &anyhow::Error) -> bool {
@@ -2094,19 +2109,19 @@ fn put_cipher(
         history,
         &meta,
     )?;
-    if let Some(new_token) = new_token {
-        db.access_token = Some(new_token);
-        save_db(db)?;
-    }
     // Agent rebuilds the master-password-reprompt ciphertext set only
-    // during sync, and only after the new vault is on disk. A failed
-    // refresh here means disk and the in-memory set still match each
-    // other (both stale versus the server). Fail closed with exit
-    // status 2: the PUT succeeded, but this process cannot claim a
-    // consistent local view. Callers must not retry the edit.
-    refresh_local_cache()?;
-    *db = load_db()?;
-    Ok(())
+    // during sync, and only after the new vault is on disk. Any local
+    // failure after the PUT (token save, sync, reload) is exit 2: the
+    // server write landed; callers must not retry it.
+    after_server_write(|| {
+        if let Some(new_token) = new_token {
+            db.access_token = Some(new_token);
+            save_db(db)?;
+        }
+        crate::actions::sync()?;
+        *db = load_db()?;
+        Ok(())
+    })
 }
 
 fn find_custom_field_index(
@@ -2376,6 +2391,7 @@ fn put_field_plaintext(
     match put_cipher(db, entry, &data, &fields, notes.as_deref(), &history) {
         Ok(()) => Ok(()),
         Err(err) if is_revision_conflict(&err) => {
+            // PUT did not land. A failed rebase sync is still exit 1.
             crate::actions::sync()?;
             *db = load_db()?;
             let entry = db
@@ -4981,6 +4997,18 @@ mod test {
         assert!(msg.contains("put failed"));
         assert!(msg.contains("the piped value was not written to disk"));
         assert!(!msg.contains("plaintext you just typed"));
+    }
+
+    #[test]
+    fn test_after_server_write_marks_exit_2() {
+        let err = after_server_write(|| {
+            Err::<(), _>(anyhow::anyhow!("save_db failed"))
+        })
+        .unwrap_err();
+        assert_eq!(exit_status(&err), 2);
+        let msg = format!("{err:#}");
+        assert!(msg.contains("save_db failed"));
+        assert!(msg.contains("do not retry the write"));
     }
 
     #[test]

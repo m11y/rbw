@@ -35,8 +35,10 @@
   rebuilds its master-password-reprompt set. The agent writes the
   vault to disk before replacing that in-memory set; a refresh
   failure after a successful PUT is an error (`rbw sync`), not a
-  silent success. `rbw add`, `rbw edit`, and `rbw generate` then exit
-  2 (not 1) and tell you not to retry the write. Stale-cipher
+  silent success. After the server write, any local follow-up failure
+  (token save, cache refresh, reload) makes `rbw add`, `rbw edit`, and
+  `rbw generate` exit 2 (not 1) and tells you not to retry the write.
+  Stale-cipher
   responses (HTTP 400 "out of date" or 409) map to a retryable
   conflict error. Field conflict retries compare the target field's
   plaintext: official clients re-encrypt every custom field on save,
