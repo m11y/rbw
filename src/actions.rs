@@ -193,7 +193,46 @@ fn add_once(
     Ok(())
 }
 
+/// 1.15-compatible cipher PUT. Does not send item key, revision, or
+/// favorite/archive — keyed items can be mixed-key corrupted. Use
+/// [`edit_with_meta`].
+#[deprecated(
+    note = "use edit_with_meta so item keys, revision, and favorite/archive are preserved"
+)]
 pub fn edit(
+    access_token: &str,
+    refresh_token: &str,
+    id: &str,
+    org_id: Option<&str>,
+    name: &str,
+    data: &crate::db::EntryData,
+    fields: &[crate::db::Field],
+    notes: Option<&str>,
+    folder_uuid: Option<&str>,
+    history: &[crate::db::HistoryEntry],
+) -> Result<(Option<String>, ())> {
+    edit_with_meta(
+        access_token,
+        refresh_token,
+        id,
+        org_id,
+        name,
+        data,
+        fields,
+        notes,
+        folder_uuid,
+        history,
+        &crate::db::CipherWriteMeta {
+            key: None,
+            reprompt: crate::api::CipherRepromptType::None,
+            favorite: false,
+            archived_date: None,
+            last_known_revision_date: None,
+        },
+    )
+}
+
+pub fn edit_with_meta(
     access_token: &str,
     refresh_token: &str,
     id: &str,
@@ -235,7 +274,7 @@ fn edit_once(
     meta: &crate::db::CipherWriteMeta<'_>,
 ) -> Result<()> {
     let (client, _) = api_client()?;
-    client.edit(
+    client.edit_with_meta(
         access_token,
         id,
         org_id,

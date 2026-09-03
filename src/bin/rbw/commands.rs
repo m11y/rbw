@@ -1931,14 +1931,7 @@ pub fn edit(
         notes.as_deref(),
         &history,
     ) {
-        if is_revision_conflict(&err) {
-            let path = persist_unsaved_edit(&unsaved)?;
-            return Err(err).context(format!(
-                "unsaved edit written to {}",
-                path.display()
-            ));
-        }
-        return Err(err);
+        return Err(err_with_unsaved(err, &unsaved));
     }
     Ok(())
 }
@@ -1952,14 +1945,37 @@ fn is_revision_conflict(err: &anyhow::Error) -> bool {
 
 fn persist_unsaved_edit(buf: &str) -> anyhow::Result<std::path::PathBuf> {
     use std::io::Write as _;
-    let mut tmp = tempfile::NamedTempFile::new()
-        .context("failed to create unsaved-edit tempfile")?;
-    tmp.write_all(buf.as_bytes())
-        .context("failed to write unsaved-edit tempfile")?;
-    let (_, path) = tmp.keep().map_err(|e| {
-        anyhow::anyhow!("failed to persist unsaved edit: {e}")
-    })?;
+    let dir = rbw::dirs::unsaved_edit_dir();
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("failed to create {}", dir.display()))?;
+    let path = dir.join(format!(
+        "unsaved-{}.txt",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let mut file = std::fs::File::create(&path)
+        .with_context(|| format!("failed to create {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .context("failed to chmod unsaved-edit file")?;
+    }
+    file.write_all(buf.as_bytes())
+        .context("failed to write unsaved-edit file")?;
     Ok(path)
+}
+
+fn err_with_unsaved(err: anyhow::Error, plaintext: &str) -> anyhow::Error {
+    match persist_unsaved_edit(plaintext) {
+        Ok(path) => err.context(format!(
+            "plaintext you just typed is in {} — delete that file after recovering",
+            path.display()
+        )),
+        Err(stash_err) => err.context(stash_err),
+    }
 }
 
 fn put_cipher(
@@ -1973,7 +1989,7 @@ fn put_cipher(
     let meta = entry.cipher_write_meta();
     let access_token = db.access_token.as_ref().unwrap();
     let refresh_token = db.refresh_token.as_ref().unwrap();
-    let (new_token, ()) = rbw::actions::edit(
+    let (new_token, ()) = rbw::actions::edit_with_meta(
         access_token,
         refresh_token,
         &entry.id,
@@ -1993,7 +2009,17 @@ fn put_cipher(
     // Agent rebuilds the master-password-reprompt ciphertext set only
     // during sync. Patching the on-disk db is not enough: a following
     // `rbw get` would decrypt the new hidden value without a prompt.
-    crate::actions::sync()?;
+    // The PUT already succeeded; a sync failure must not look like the
+    // edit itself failed.
+    if let Err(e) = crate::actions::sync() {
+        log::warn!(
+            "edit saved on the server, but local cache refresh failed: {e}"
+        );
+        eprintln!(
+            "edit saved on the server, but the local cache was not refreshed; run `rbw sync`"
+        );
+        return Ok(());
+    }
     *db = load_db()?;
     Ok(())
 }
@@ -2251,16 +2277,20 @@ fn put_field_plaintext(
             if entry.fields[idx].value.as_deref() != original_ciphertext {
                 // Another client changed this same field. Rebase would
                 // use the new revision and silently overwrite them.
-                return Err(err).context(
-                    "the same custom field was changed on the server",
-                );
+                return Err(err_with_unsaved(
+                    err.context(
+                        "the same custom field was changed on the server",
+                    ),
+                    plaintext,
+                ));
             }
             validate_boolean_field(ty, plaintext)?;
             let (data, fields, notes, history) =
                 encrypt_named_field(&entry, field_name, plaintext)?;
             put_cipher(db, &entry, &data, &fields, notes.as_deref(), &history)
+                .map_err(|err| err_with_unsaved(err, plaintext))
         }
-        Err(err) => Err(err),
+        Err(err) => Err(err_with_unsaved(err, plaintext)),
     }
 }
 
@@ -4725,6 +4755,18 @@ mod test {
         assert!(strip_help_block(&end_before_start, start, end).is_err());
         let leftover_body = format!("value\n{HELP_BODY}\n");
         assert!(strip_help_block(&leftover_body, start, end).is_err());
+    }
+
+    #[test]
+    fn test_unique_help_markers_avoid_existing_fence() {
+        let stale_start = "# --- rbw field help start OLDNONCE ---";
+        let stale_end = "# --- rbw field help end OLDNONCE ---";
+        let current = format!("keep {stale_start} {stale_end} keep");
+        let (start, end) = unique_help_markers(&current);
+        assert_ne!(start, stale_start);
+        assert_ne!(end, stale_end);
+        assert!(!current.contains(&start));
+        assert!(!current.contains(&end));
     }
 
     #[test]

@@ -21,8 +21,11 @@
 * Cipher PUT now sends `reprompt`, `favorite`, `archivedDate`, and
   `lastKnownRevisionDate`. `rbw edit` syncs before resolving the
   name/URI selector, and again after a successful PUT so the agent
-  rebuilds its master-password-reprompt set. Stale-cipher responses
-  (HTTP 400 "out of date" or 409) map to a retryable conflict error.
+  rebuilds its master-password-reprompt set. A failed cache refresh
+  after a successful PUT is a warning, not an edit failure.
+  Stale-cipher responses (HTTP 400 "out of date" or 409) map to a
+  retryable conflict error. Rejected edits keep the plaintext in
+  `$RBW runtime/unsaved-edits/` (mode 0600) until you delete it.
 
 ## [1.15.0] - 2025-12-31
 

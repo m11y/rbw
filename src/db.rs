@@ -25,9 +25,13 @@ pub struct Entry {
     // sync gave us so a field-only edit does not clobber them.
     //
     // `serde(default)` is only for reading a 1.15.0 on-disk cache.
-    // Those defaults are not server truth — `refresh_entry` must sync
-    // before any cipher PUT so we do not unfavorite/unarchive on the
-    // first edit after upgrade.
+    // Those defaults are not server truth — `edit` syncs before
+    // resolving the selector so the first PUT after upgrade does not
+    // unfavorite/unarchive.
+    //
+    // Adding these fields is a Rust source break for downstream struct
+    // literals. JSON load stays compatible. Prefer `edit_with_meta`
+    // over constructing `Entry` by hand.
     #[serde(default)]
     pub favorite: bool,
     #[serde(default)]
