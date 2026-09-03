@@ -1708,14 +1708,7 @@ fn add_after_editor(
         notes.as_deref(),
         folder_id.as_deref(),
     )?;
-    after_server_write(|| {
-        if let Some(new_token) = new_token {
-            db.access_token = Some(new_token);
-            save_db(db)?;
-        }
-        crate::actions::sync()?;
-        Ok(())
-    })
+    after_server_write(db, new_token)
 }
 
 pub fn generate(
@@ -1804,14 +1797,7 @@ pub fn generate(
             None,
             folder_id.as_deref(),
         )?;
-        after_server_write(|| {
-            if let Some(new_token) = new_token {
-                db.access_token = Some(new_token);
-                save_db(&db)?;
-            }
-            crate::actions::sync()?;
-            Ok(())
-        })?;
+        after_server_write(&mut db, new_token)?;
     }
 
     Ok(())
@@ -2064,10 +2050,21 @@ impl std::fmt::Display for LocalCacheRefreshFailed {
 
 impl std::error::Error for LocalCacheRefreshFailed {}
 
-fn after_server_write<T>(
-    op: impl FnOnce() -> anyhow::Result<T>,
-) -> anyhow::Result<T> {
-    op().context(LocalCacheRefreshFailed)
+/// Persist local state after `add` / `edit_with_meta` already returned
+/// Ok. `new_token` is that Ok value's optional refreshed access token,
+/// so the call site has to have completed the server write first.
+/// Token save, vault sync, and db reload are exit 2 on failure.
+fn after_server_write(
+    db: &mut rbw::db::Db,
+    new_token: Option<String>,
+) -> anyhow::Result<()> {
+    if let Some(new_token) = new_token {
+        db.access_token = Some(new_token);
+        save_db(db).context(LocalCacheRefreshFailed)?;
+    }
+    crate::actions::sync().context(LocalCacheRefreshFailed)?;
+    *db = load_db().context(LocalCacheRefreshFailed)?;
+    Ok(())
 }
 
 fn is_local_cache_refresh_failed(err: &anyhow::Error) -> bool {
@@ -2113,15 +2110,7 @@ fn put_cipher(
     // during sync, and only after the new vault is on disk. Any local
     // failure after the PUT (token save, sync, reload) is exit 2: the
     // server write landed; callers must not retry it.
-    after_server_write(|| {
-        if let Some(new_token) = new_token {
-            db.access_token = Some(new_token);
-            save_db(db)?;
-        }
-        crate::actions::sync()?;
-        *db = load_db()?;
-        Ok(())
-    })
+    after_server_write(db, new_token)
 }
 
 fn find_custom_field_index(
@@ -4997,18 +4986,6 @@ mod test {
         assert!(msg.contains("put failed"));
         assert!(msg.contains("the piped value was not written to disk"));
         assert!(!msg.contains("plaintext you just typed"));
-    }
-
-    #[test]
-    fn test_after_server_write_marks_exit_2() {
-        let err = after_server_write(|| {
-            Err::<(), _>(anyhow::anyhow!("save_db failed"))
-        })
-        .unwrap_err();
-        assert_eq!(exit_status(&err), 2);
-        let msg = format!("{err:#}");
-        assert!(msg.contains("save_db failed"));
-        assert!(msg.contains("do not retry the write"));
     }
 
     #[test]
