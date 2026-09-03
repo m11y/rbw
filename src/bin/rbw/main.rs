@@ -83,6 +83,12 @@ enum Opt {
         clipboard: bool,
         #[structopt(short, long, help = "List fields in this entry")]
         list_fields: bool,
+        #[arg(
+            long,
+            help = "List custom fields in this entry (not linked fields)",
+            conflicts_with = "list_fields"
+        )]
+        list_custom_fields: bool,
     },
 
     #[command(about = "Search for entries")]
@@ -203,11 +209,24 @@ enum Opt {
             The editor to use is determined  by the value of the \
             $VISUAL or $EDITOR environment variables. The first line \
             will be saved as the password and the remainder will be saved \
-            as a note."
+            as a note.\n\n\
+            Pass --field to change a custom field instead of the \
+            password and notes. Piped stdin is stored as the new value \
+            (trailing newlines are stripped); an interactive terminal \
+            opens the editor. The named custom field must already exist. \
+            Empty values are refused. Login, secure note, card, and \
+            identity entries are supported; SSH key entries and linked \
+            fields cannot be edited this way."
     )]
     Edit {
         #[command(flatten)]
         find_args: FindArgs,
+        #[arg(
+            short,
+            long,
+            help = "Custom field to edit instead of password/notes"
+        )]
+        field: Option<String>,
     },
 
     #[command(about = "Remove a given entry", visible_alias = "rm")]
@@ -346,6 +365,7 @@ fn main() {
             #[cfg(feature = "clipboard")]
             clipboard,
             list_fields,
+            list_custom_fields,
         } => commands::get(
             find_args.needle.clone(),
             find_args.user.as_deref(),
@@ -359,6 +379,7 @@ fn main() {
             false,
             find_args.ignorecase,
             list_fields,
+            list_custom_fields,
         ),
         Opt::Search {
             term,
@@ -430,11 +451,12 @@ fn main() {
                 ty,
             )
         }
-        Opt::Edit { find_args } => commands::edit(
+        Opt::Edit { find_args, field } => commands::edit(
             find_args.needle,
             find_args.user.as_deref(),
             find_args.folder.as_deref(),
             find_args.ignorecase,
+            field.as_deref(),
         ),
         Opt::Remove { find_args } => commands::remove(
             find_args.needle,

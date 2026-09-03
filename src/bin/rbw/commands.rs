@@ -1227,6 +1227,37 @@ const HELP_NOTES: &str = r"
 # Lines with leading # will be ignored.
 ";
 
+fn unique_help_markers(current: &str) -> (String, String) {
+    use rand::distr::SampleString as _;
+    loop {
+        let nonce =
+            rand::distr::Alphanumeric.sample_string(&mut rand::rng(), 16);
+        let start = format!("# --- rbw field help start {nonce} ---");
+        let end = format!("# --- rbw field help end {nonce} ---");
+        if !current.contains(&start) && !current.contains(&end) {
+            return (start, end);
+        }
+    }
+}
+
+const HELP_BODY: &str =
+    "# The content of this file will be stored as the custom field value.\n\
+     # Empty values are refused.";
+const HELP_BODY_BOOLEAN: &str =
+    "# Enter true or false (nothing else).\n# Empty values are refused.";
+
+fn help_body(boolean: bool) -> &'static str {
+    if boolean {
+        HELP_BODY_BOOLEAN
+    } else {
+        HELP_BODY
+    }
+}
+
+fn field_help(boolean: bool, start: &str, end: &str) -> String {
+    format!("\n{start}\n{}\n{end}\n", help_body(boolean))
+}
+
 pub fn config_show() -> anyhow::Result<()> {
     let config = rbw::config::Config::load()?;
     serde_json::to_writer_pretty(std::io::stdout(), &config)
@@ -1394,6 +1425,7 @@ pub fn get(
     clipboard: bool,
     ignore_case: bool,
     list_fields: bool,
+    list_custom_fields: bool,
 ) -> anyhow::Result<()> {
     unlock()?;
 
@@ -1404,6 +1436,15 @@ pub fn get(
         user.map_or_else(String::new, |s| format!("{s}@")),
         needle
     );
+
+    if list_custom_fields {
+        // Names only: decrypting hidden *values* would master-password
+        // reprompt, which is hostile for fish `edit --field` completion.
+        let entry = find_db_entry(&db, needle, user, folder, ignore_case)
+            .with_context(|| format!("couldn't find entry for '{desc}'"))?;
+        print_editable_custom_field_names(&entry)?;
+        return Ok(());
+    }
 
     let (_, decrypted) =
         find_entry(&db, needle, user, folder, ignore_case)
@@ -1767,6 +1808,7 @@ pub fn edit(
     username: Option<&str>,
     folder: Option<&str>,
     ignore_case: bool,
+    field: Option<&str>,
 ) -> anyhow::Result<()> {
     unlock()?;
 
@@ -1783,6 +1825,14 @@ pub fn edit(
     let mut db = load_db()?;
     let entry = find_db_entry(&db, name, username, folder, ignore_case)
         .with_context(|| format!("couldn't find entry for '{desc}'"))?;
+
+    if let Some(field_name) = field {
+        // Decrypt only the target field. Full decrypt_cipher would pinentry
+        // once per hidden value, and encrypt_field_on_entry used to do it
+        // a second time.
+        edit_custom_field(&mut db, &entry, field_name)?;
+        return Ok(());
+    }
 
     let decrypted = decrypt_cipher(&entry)?;
 
@@ -1819,6 +1869,13 @@ pub fn edit(
             "modifications are only supported for login and note entries"
         )),
     }
+}
+
+fn is_revision_conflict(err: &anyhow::Error) -> bool {
+    matches!(
+        err.downcast_ref::<rbw::error::Error>(),
+        Some(rbw::error::Error::CipherRevisionConflict)
+    )
 }
 
 fn put_login_edit(
@@ -2055,6 +2112,337 @@ fn put_cipher(
     after_server_write(db, new_token)
 }
 
+fn find_custom_field_index(
+    fields: &[DecryptedField],
+    name: &str,
+) -> anyhow::Result<usize> {
+    let exact: Vec<usize> = fields
+        .iter()
+        .enumerate()
+        .filter_map(|(i, field)| {
+            field.name.as_deref().filter(|n| *n == name).map(|_| i)
+        })
+        .collect();
+    match exact.len() {
+        1 => return Ok(exact[0]),
+        n if n > 1 => {
+            anyhow::bail!("multiple custom fields named '{name}'")
+        }
+        _ => {}
+    }
+
+    let lower = name.to_lowercase();
+    let case_insensitive: Vec<usize> = fields
+        .iter()
+        .enumerate()
+        .filter_map(|(i, field)| {
+            field
+                .name
+                .as_deref()
+                .filter(|n| n.to_lowercase() == lower)
+                .map(|_| i)
+        })
+        .collect();
+    match case_insensitive.len() {
+        1 => Ok(case_insensitive[0]),
+        0 => anyhow::bail!("no custom field named '{name}'"),
+        _ => anyhow::bail!("multiple custom fields matching '{name}'"),
+    }
+}
+
+fn strip_trailing_newlines(s: &str) -> String {
+    s.trim_end_matches(['\n', '\r']).to_string()
+}
+
+fn marker_span_start(raw: &str, marker_at: usize) -> usize {
+    if marker_at >= 2
+        && raw.as_bytes()[marker_at - 2] == b'\r'
+        && raw.as_bytes()[marker_at - 1] == b'\n'
+    {
+        marker_at - 2
+    } else if marker_at >= 1 && raw.as_bytes()[marker_at - 1] == b'\n' {
+        marker_at - 1
+    } else {
+        marker_at
+    }
+}
+
+fn strip_help_block(
+    raw: &str,
+    start: &str,
+    end: &str,
+) -> anyhow::Result<String> {
+    // Per-edit random markers: a user value may already contain a
+    // previous help fence. find() would then delete from that fence to
+    // the appended END and silently truncate. The nonce is chosen not
+    // to appear in the current value.
+    let start_at = raw.find(start);
+    let end_at = raw.find(end);
+    let combined = match (start_at, end_at) {
+        (Some(s), Some(e)) if e > s => {
+            let from = marker_span_start(raw, s);
+            let to = e + end.len();
+            format!("{}{}", &raw[..from], &raw[to..])
+        }
+        (None, None) => raw.to_string(),
+        _ => anyhow::bail!(
+            "unbalanced help markers; leave the rbw help block intact \
+             or remove it entirely"
+        ),
+    };
+    if combined.contains(start)
+        || combined.contains(end)
+        || contains_help_body(&combined)
+    {
+        anyhow::bail!(
+            "editor output still contains the help text; \
+             remove it or leave the help block intact"
+        );
+    }
+    Ok(strip_trailing_newlines(&combined))
+}
+
+fn contains_help_body(text: &str) -> bool {
+    help_body(false)
+        .lines()
+        .chain(help_body(true).lines())
+        .filter(|line| !line.is_empty())
+        .any(|help_line| {
+            text.lines()
+                .any(|line| line.trim_end_matches('\r') == help_line)
+        })
+}
+
+fn read_custom_field_value(
+    current: &str,
+    ty: Option<rbw::api::FieldType>,
+) -> anyhow::Result<(String, rbw::edit::Source)> {
+    let (start, end) = unique_help_markers(current);
+    let help =
+        field_help(ty == Some(rbw::api::FieldType::Boolean), &start, &end);
+    let mut current = current.to_string();
+    let mut attempts = 0_u8;
+    loop {
+        let (raw, source) = rbw::edit::edit_from(&current, &help)?;
+        let value = match source {
+            rbw::edit::Source::Pipe => strip_trailing_newlines(&raw),
+            rbw::edit::Source::Editor => {
+                match strip_help_block(&raw, &start, &end) {
+                    Ok(value) => value,
+                    Err(e) => return Err(err_with_unsaved(e, &raw)),
+                }
+            }
+        };
+        if value.is_empty() {
+            anyhow::bail!("refusing to set an empty custom field value");
+        }
+        match validate_boolean_field(ty, &value) {
+            Ok(()) => return Ok((value, source)),
+            Err(e) if source == rbw::edit::Source::Editor => {
+                // Non-interactive $EDITOR that echoes the file (true,
+                // /bin/true) would loop forever if the stored value is
+                // already invalid.
+                attempts += 1;
+                if value == current || attempts >= 3 {
+                    return Err(err_with_unsaved(e, &value));
+                }
+                eprintln!("{e}; edit again");
+                current = value;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+fn validate_boolean_field(
+    ty: Option<rbw::api::FieldType>,
+    value: &str,
+) -> anyhow::Result<()> {
+    if ty == Some(rbw::api::FieldType::Boolean)
+        && value != "true"
+        && value != "false"
+    {
+        anyhow::bail!("boolean custom fields must be true or false");
+    }
+    Ok(())
+}
+
+fn edit_custom_field(
+    db: &mut rbw::db::Db,
+    entry: &rbw::db::Entry,
+    field_name: &str,
+) -> anyhow::Result<()> {
+    // Client::edit_with_meta has no SSH key PUT payload (unreachable!).
+    // Login, Secure Note, Card, and Identity all have typed PUT bodies.
+    if matches!(entry.data, rbw::db::EntryData::SshKey { .. }) {
+        anyhow::bail!(
+            "custom field edits are not supported for SSH key entries"
+        );
+    }
+
+    let (idx, ty) = named_custom_field(entry, field_name)?;
+    if ty == Some(rbw::api::FieldType::Linked) {
+        anyhow::bail!("linked custom fields cannot be edited as values");
+    }
+
+    let current = decrypt_custom_field_value(entry, idx)?;
+    let (new_value, source) = read_custom_field_value(&current, ty)?;
+    let original_ct = entry.fields[idx].value.clone();
+    after_editor(
+        source,
+        &new_value,
+        put_field_plaintext(
+            db,
+            entry,
+            field_name,
+            &new_value,
+            original_ct.as_deref(),
+            &current,
+        ),
+    )
+}
+
+fn named_custom_field(
+    entry: &rbw::db::Entry,
+    field_name: &str,
+) -> anyhow::Result<(usize, Option<rbw::api::FieldType>)> {
+    let mut decrypted_names = Vec::with_capacity(entry.fields.len());
+    for field in &entry.fields {
+        let name = field
+            .name
+            .as_ref()
+            .map(|name| {
+                crate::actions::decrypt(
+                    name,
+                    entry.key.as_deref(),
+                    entry.org_id.as_deref(),
+                )
+            })
+            .transpose()?;
+        decrypted_names.push(DecryptedField {
+            name,
+            value: None,
+            ty: field.ty,
+        });
+    }
+    let idx = find_custom_field_index(&decrypted_names, field_name)?;
+    Ok((idx, entry.fields[idx].ty))
+}
+
+fn decrypt_custom_field_value(
+    entry: &rbw::db::Entry,
+    idx: usize,
+) -> anyhow::Result<String> {
+    entry.fields[idx]
+        .value
+        .as_ref()
+        .map(|value| {
+            crate::actions::decrypt(
+                value,
+                entry.key.as_deref(),
+                entry.org_id.as_deref(),
+            )
+        })
+        .transpose()
+        .map(std::option::Option::unwrap_or_default)
+}
+
+/// True when a concurrent save changed this field's plaintext.
+///
+/// Ciphertext inequality is not enough. Official Bitwarden clients
+/// encrypt `CipherView` from scratch on every save
+/// (`FieldView::encrypt_composite` always encrypts name+value). AES-CBC
+/// uses a random IV, so a notes-only edit rotates this field's
+/// ciphertext while leaving the value alone. rbw itself leaves
+/// untouched fields' ciphertext unchanged, so equal ciphertext is a
+/// decrypt-free fast path.
+fn target_field_plaintext_changed(
+    original_ciphertext: Option<&str>,
+    original_plaintext: &str,
+    server_ciphertext: Option<&str>,
+    server_plaintext: &str,
+) -> bool {
+    original_ciphertext != server_ciphertext
+        && original_plaintext != server_plaintext
+}
+
+fn put_field_plaintext(
+    db: &mut rbw::db::Db,
+    entry: &rbw::db::Entry,
+    field_name: &str,
+    plaintext: &str,
+    original_ciphertext: Option<&str>,
+    original_plaintext: &str,
+) -> anyhow::Result<()> {
+    let (data, fields, notes, history) =
+        encrypt_named_field(entry, field_name, plaintext)?;
+    match put_cipher(db, entry, &data, &fields, notes.as_deref(), &history) {
+        Ok(()) => Ok(()),
+        Err(err) if is_revision_conflict(&err) => {
+            // PUT did not land. A failed rebase sync is still exit 1.
+            crate::actions::sync()?;
+            *db = load_db()?;
+            let entry = db
+                .entries
+                .iter()
+                .find(|item| item.id == entry.id)
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("entry disappeared after conflict sync")
+                })?;
+            let (idx, ty) = named_custom_field(&entry, field_name)?;
+            let server_ct = entry.fields[idx].value.as_deref();
+            if original_ciphertext != server_ct {
+                let server_pt = decrypt_custom_field_value(&entry, idx)?;
+                if target_field_plaintext_changed(
+                    original_ciphertext,
+                    original_plaintext,
+                    server_ct,
+                    &server_pt,
+                ) {
+                    return Err(err.context(
+                        "the same custom field was changed on the server",
+                    ));
+                }
+            }
+            validate_boolean_field(ty, plaintext)?;
+            let (data, fields, notes, history) =
+                encrypt_named_field(&entry, field_name, plaintext)?;
+            put_cipher(db, &entry, &data, &fields, notes.as_deref(), &history)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn encrypt_named_field(
+    entry: &rbw::db::Entry,
+    field_name: &str,
+    plaintext: &str,
+) -> anyhow::Result<(
+    rbw::db::EntryData,
+    Vec<rbw::db::Field>,
+    Option<String>,
+    Vec<rbw::db::HistoryEntry>,
+)> {
+    let (idx, ty) = named_custom_field(entry, field_name)?;
+    if ty == Some(rbw::api::FieldType::Linked) {
+        anyhow::bail!("linked custom fields cannot be edited as values");
+    }
+    let encrypted = crate::actions::encrypt(
+        plaintext,
+        entry.key.as_deref(),
+        entry.org_id.as_deref(),
+    )?;
+    let mut fields = entry.fields.clone();
+    fields[idx].value = Some(encrypted);
+    Ok((
+        entry.data.clone(),
+        fields,
+        entry.notes.clone(),
+        entry.history.clone(),
+    ))
+}
+
 pub fn remove(
     name: Needle,
     username: Option<&str>,
@@ -2240,6 +2628,29 @@ fn find_db_entry(
     let (entry, _) =
         find_entry_raw(&ciphers, &needle, username, folder, ignore_case)?;
     Ok(entry)
+}
+
+fn print_editable_custom_field_names(
+    entry: &rbw::db::Entry,
+) -> anyhow::Result<()> {
+    if matches!(entry.data, rbw::db::EntryData::SshKey { .. }) {
+        anyhow::bail!("SSH key entries have no editable custom fields");
+    }
+    for field in &entry.fields {
+        if field.ty == Some(rbw::api::FieldType::Linked) {
+            continue;
+        }
+        let Some(name) = &field.name else {
+            continue;
+        };
+        let name = crate::actions::decrypt(
+            name,
+            entry.key.as_deref(),
+            entry.org_id.as_deref(),
+        )?;
+        println!("{name}");
+    }
+    Ok(())
 }
 
 fn find_entry_raw(
@@ -4379,6 +4790,162 @@ mod test {
                 notes: None,
             },
         )
+    }
+
+    fn custom_field(name: &str) -> DecryptedField {
+        DecryptedField {
+            name: Some(name.to_string()),
+            value: Some("v".to_string()),
+            ty: Some(rbw::api::FieldType::Hidden),
+        }
+    }
+
+    #[test]
+    fn test_find_custom_field_index() {
+        let fields = vec![
+            custom_field("GITHUB_CONTENT_TOKEN"),
+            custom_field("GITHUB_ISSUE_TOKEN"),
+        ];
+        assert_eq!(
+            find_custom_field_index(&fields, "GITHUB_CONTENT_TOKEN").unwrap(),
+            0
+        );
+        assert_eq!(
+            find_custom_field_index(&fields, "github_issue_token").unwrap(),
+            1
+        );
+        assert!(find_custom_field_index(&fields, "missing").is_err());
+    }
+
+    #[test]
+    fn test_find_custom_field_index_duplicates() {
+        let fields = vec![custom_field("FOO"), custom_field("FOO")];
+        assert!(find_custom_field_index(&fields, "FOO").is_err());
+        let fields = vec![custom_field("FOO"), custom_field("foo")];
+        assert_eq!(find_custom_field_index(&fields, "FOO").unwrap(), 0);
+        assert_eq!(find_custom_field_index(&fields, "foo").unwrap(), 1);
+        assert!(find_custom_field_index(&fields, "FoO").is_err());
+    }
+
+    #[test]
+    fn test_strip_trailing_newlines() {
+        assert_eq!(strip_trailing_newlines("abc\n"), "abc");
+        assert_eq!(strip_trailing_newlines("abc\r\n"), "abc");
+        assert_eq!(strip_trailing_newlines("abc"), "abc");
+        assert_eq!(strip_trailing_newlines("a\nbc\n"), "a\nbc");
+    }
+
+    #[test]
+    fn test_strip_help_block() {
+        let start = "# --- rbw field help start TESTNONCE ---";
+        let end = "# --- rbw field help end TESTNONCE ---";
+        let help = field_help(false, start, end);
+        let contents = format!("value\n#keep{help}");
+        assert_eq!(
+            strip_help_block(&contents, start, end).unwrap(),
+            "value\n#keep"
+        );
+
+        let crlf = format!("value\r\n#keep{}", help.replace('\n', "\r\n"));
+        assert_eq!(
+            strip_help_block(&crlf, start, end).unwrap(),
+            "value\r\n#keep"
+        );
+
+        let after = format!("value{help}# mine\n");
+        assert_eq!(
+            strip_help_block(&after, start, end).unwrap(),
+            "value\n# mine"
+        );
+
+        assert_eq!(strip_help_block(&help, start, end).unwrap(), "");
+        assert_eq!(
+            strip_help_block("just-piped\n", start, end).unwrap(),
+            "just-piped"
+        );
+
+        let crlf_value = format!("a\r\nb{help}");
+        assert_eq!(
+            strip_help_block(&crlf_value, start, end).unwrap(),
+            "a\r\nb"
+        );
+
+        let stale = "# --- rbw field help start OLDNONCE ---";
+        let with_stale = format!("keep {stale} keep{help}");
+        assert_eq!(
+            strip_help_block(&with_stale, start, end).unwrap(),
+            format!("keep {stale} keep")
+        );
+
+        assert!(
+            strip_help_block(&format!("value\n{end}\n"), start, end).is_err()
+        );
+        assert!(strip_help_block(&format!("value\n{start}\n"), start, end)
+            .is_err());
+        let end_before_start = format!("value\n{end}\n{start}\n");
+        assert!(strip_help_block(&end_before_start, start, end).is_err());
+        let leftover_body = format!("value\n{HELP_BODY}\n");
+        assert!(strip_help_block(&leftover_body, start, end).is_err());
+    }
+
+    #[test]
+    fn test_unique_help_markers_avoid_existing_fence() {
+        let stale_start = "# --- rbw field help start OLDNONCE ---";
+        let stale_end = "# --- rbw field help end OLDNONCE ---";
+        let current = format!("keep {stale_start} {stale_end} keep");
+        let (start, end) = unique_help_markers(&current);
+        assert_ne!(start, stale_start);
+        assert_ne!(end, stale_end);
+        assert!(!current.contains(&start));
+        assert!(!current.contains(&end));
+    }
+
+    #[test]
+    fn test_validate_boolean_field() {
+        assert!(validate_boolean_field(
+            Some(rbw::api::FieldType::Hidden),
+            "any"
+        )
+        .is_ok());
+        assert!(validate_boolean_field(
+            Some(rbw::api::FieldType::Boolean),
+            "true"
+        )
+        .is_ok());
+        assert!(validate_boolean_field(
+            Some(rbw::api::FieldType::Boolean),
+            "false"
+        )
+        .is_ok());
+        assert!(validate_boolean_field(
+            Some(rbw::api::FieldType::Boolean),
+            "yes"
+        )
+        .is_err());
+        // Linked is rejected before read/validate, not here.
+        assert!(validate_boolean_field(
+            Some(rbw::api::FieldType::Linked),
+            "anything"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn test_target_field_plaintext_changed() {
+        let old_ct = Some("2.aaa");
+        let new_ct = Some("2.bbb");
+        assert!(!target_field_plaintext_changed(
+            old_ct, "token", old_ct, "token"
+        ));
+        // Official client re-encrypted the field in place.
+        assert!(!target_field_plaintext_changed(
+            old_ct, "token", new_ct, "token"
+        ));
+        assert!(target_field_plaintext_changed(
+            old_ct, "token", new_ct, "other"
+        ));
+        assert!(!target_field_plaintext_changed(None, "", None, ""));
+        assert!(target_field_plaintext_changed(None, "", new_ct, "other"));
     }
 
     #[test]
