@@ -30,8 +30,9 @@ pub struct Entry {
     // unfavorite/unarchive.
     //
     // Adding these fields is a Rust source break for downstream struct
-    // literals. JSON load stays compatible. Prefer `edit_with_meta`
-    // over constructing `Entry` by hand.
+    // literals. JSON load stays compatible. Cipher PUTs go through
+    // `edit_with_meta`; the 1.15 `edit` signatures are gone because
+    // they omitted `key` and reset favorite/archive.
     #[serde(default)]
     pub favorite: bool,
     #[serde(default)]

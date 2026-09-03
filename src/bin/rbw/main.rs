@@ -245,7 +245,8 @@ enum Opt {
     #[command(about = "Lock the password database")]
     Lock,
 
-    #[command(about = "Remove the local copy of the password database")]
+    #[command(about = "Remove the local copy of the password database, \
+            including unsaved editor buffers")]
     Purge,
 
     #[command(name = "stop-agent", about = "Terminate the background agent")]

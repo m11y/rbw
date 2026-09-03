@@ -10,7 +10,7 @@ pub fn make_all() -> Result<()> {
     Ok(())
 }
 
-fn create_dir_all_with_permissions(
+pub fn create_dir_all_with_permissions(
     path: &std::path::Path,
     mode: u32,
 ) -> Result<()> {
