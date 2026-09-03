@@ -14,6 +14,11 @@ pub fn stdin_is_pipe() -> bool {
     !std::io::stdin().is_terminal()
 }
 
+/// Read an edited buffer from a pipe or `$VISUAL`/`$EDITOR`.
+///
+/// Drops whether the value came from a pipe. Prefer [`edit_from`] when
+/// the caller must treat those sources differently (for example to
+/// avoid writing piped secrets to disk).
 pub fn edit(contents: &str, help: &str) -> Result<String> {
     Ok(edit_from(contents, help)?.0)
 }

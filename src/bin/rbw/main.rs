@@ -1,6 +1,5 @@
 use std::io::Write as _;
 
-use anyhow::Context as _;
 use clap::{CommandFactory as _, Parser as _};
 
 mod actions;
@@ -538,11 +537,11 @@ fn main() {
             }
             Ok(())
         }
-    }
-    .with_context(|| format!("rbw {subcommand_name}"));
+    };
 
     if let Err(e) = res {
-        eprintln!("{e:#}");
-        std::process::exit(1);
+        let code = commands::exit_status(&e);
+        eprintln!("{:#}", e.context(format!("rbw {subcommand_name}")));
+        std::process::exit(code);
     }
 }

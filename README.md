@@ -133,6 +133,12 @@ vault before opening the editor, so it needs network access. Piped
 stdin is stored as the new value (trailing newlines are stripped), or an
 editor is opened when stdin is a terminal. Empty values are refused.
 SSH key entries and linked fields cannot be edited this way.
+If an interactive editor save fails before the server write, the typed
+buffer is kept under the rbw runtime `unsaved-edits/` directory; delete
+it after recovering, or run `rbw purge`. Piped stdin is never written
+there. If the server write succeeded but the local cache could not be
+refreshed, the command exits 2 — run `rbw sync` and do not retry the
+write.
 `rbw get --list-custom-fields` lists the editable custom field names for
 an entry. In addition to matching against the name, you can pass a UUID
 as the name to search for the entry with that id, or a URL to search for

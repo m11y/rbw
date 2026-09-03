@@ -1607,9 +1607,6 @@ pub fn add(
     let mut db = load_db()?;
     // unwrap is safe here because the call to unlock above is guaranteed to
     // populate these or error
-    let mut access_token = db.access_token.as_ref().unwrap().clone();
-    // Cloned so the post-editor closure can mutably borrow `db`.
-    let refresh_token = db.refresh_token.as_ref().unwrap().clone();
 
     let name = crate::actions::encrypt(name, None, None)?;
 
@@ -1621,87 +1618,94 @@ pub fn add(
     after_editor(
         source,
         &contents,
-        (|| {
-            let (password, notes) = parse_editor(&contents);
-            let password = password
-                .map(|password| {
-                    crate::actions::encrypt(&password, None, None)
-                })
-                .transpose()?;
-            let notes = notes
-                .map(|notes| crate::actions::encrypt(&notes, None, None))
-                .transpose()?;
-            let uris: Vec<_> = uris
-                .iter()
-                .map(|uri| {
-                    Ok(rbw::db::Uri {
-                        uri: crate::actions::encrypt(&uri.0, None, None)?,
-                        match_type: uri.1,
-                    })
-                })
-                .collect::<anyhow::Result<_>>()?;
+        add_after_editor(&mut db, &name, username, uris, folder, &contents),
+    )
+}
 
-            let mut folder_id = None;
-            if let Some(folder_name) = folder {
-                let (new_access_token, folders) = rbw::actions::list_folders(
-                    &access_token,
-                    &refresh_token,
-                )?;
-                if let Some(new_access_token) = new_access_token {
-                    access_token.clone_from(&new_access_token);
-                    db.access_token = Some(new_access_token);
-                    save_db(&db)?;
-                }
+fn add_after_editor(
+    db: &mut rbw::db::Db,
+    name: &str,
+    username: Option<String>,
+    uris: &[(String, Option<rbw::api::UriMatchType>)],
+    folder: Option<&str>,
+    contents: &str,
+) -> anyhow::Result<()> {
+    let mut access_token = db.access_token.as_ref().unwrap().clone();
+    let refresh_token = db.refresh_token.as_ref().unwrap().clone();
 
-                let folders: Vec<(String, String)> = folders
-                    .iter()
-                    .cloned()
-                    .map(|(id, name)| {
-                        Ok((id, crate::actions::decrypt(&name, None, None)?))
-                    })
-                    .collect::<anyhow::Result<_>>()?;
+    let (password, notes) = parse_editor(contents);
+    let password = password
+        .map(|password| crate::actions::encrypt(&password, None, None))
+        .transpose()?;
+    let notes = notes
+        .map(|notes| crate::actions::encrypt(&notes, None, None))
+        .transpose()?;
+    let uris: Vec<_> = uris
+        .iter()
+        .map(|uri| {
+            Ok(rbw::db::Uri {
+                uri: crate::actions::encrypt(&uri.0, None, None)?,
+                match_type: uri.1,
+            })
+        })
+        .collect::<anyhow::Result<_>>()?;
 
-                for (id, name) in folders {
-                    if name == folder_name {
-                        folder_id = Some(id);
-                    }
-                }
-                if folder_id.is_none() {
-                    let (new_access_token, id) = rbw::actions::create_folder(
-                        &access_token,
-                        &refresh_token,
-                        &crate::actions::encrypt(folder_name, None, None)?,
-                    )?;
-                    if let Some(new_access_token) = new_access_token {
-                        access_token.clone_from(&new_access_token);
-                        db.access_token = Some(new_access_token);
-                        save_db(&db)?;
-                    }
-                    folder_id = Some(id);
-                }
+    let mut folder_id = None;
+    if let Some(folder_name) = folder {
+        let (new_access_token, folders) =
+            rbw::actions::list_folders(&access_token, &refresh_token)?;
+        if let Some(new_access_token) = new_access_token {
+            access_token.clone_from(&new_access_token);
+            db.access_token = Some(new_access_token);
+            save_db(db)?;
+        }
+
+        let folders: Vec<(String, String)> = folders
+            .iter()
+            .cloned()
+            .map(|(id, name)| {
+                Ok((id, crate::actions::decrypt(&name, None, None)?))
+            })
+            .collect::<anyhow::Result<_>>()?;
+
+        for (id, name) in folders {
+            if name == folder_name {
+                folder_id = Some(id);
             }
-
-            if let (Some(access_token), ()) = rbw::actions::add(
+        }
+        if folder_id.is_none() {
+            let (new_access_token, id) = rbw::actions::create_folder(
                 &access_token,
                 &refresh_token,
-                &name,
-                &rbw::db::EntryData::Login {
-                    username,
-                    password,
-                    uris,
-                    totp: None,
-                },
-                notes.as_deref(),
-                folder_id.as_deref(),
-            )? {
-                db.access_token = Some(access_token);
-                save_db(&db)?;
+                &crate::actions::encrypt(folder_name, None, None)?,
+            )?;
+            if let Some(new_access_token) = new_access_token {
+                access_token.clone_from(&new_access_token);
+                db.access_token = Some(new_access_token);
+                save_db(db)?;
             }
+            folder_id = Some(id);
+        }
+    }
 
-            crate::actions::sync()?;
-            Ok(())
-        })(),
-    )
+    if let (Some(access_token), ()) = rbw::actions::add(
+        &access_token,
+        &refresh_token,
+        name,
+        &rbw::db::EntryData::Login {
+            username,
+            password,
+            uris,
+            totp: None,
+        },
+        notes.as_deref(),
+        folder_id.as_deref(),
+    )? {
+        db.access_token = Some(access_token);
+        save_db(db)?;
+    }
+
+    refresh_local_cache()
 }
 
 pub fn generate(
@@ -1794,7 +1798,7 @@ pub fn generate(
             save_db(&db)?;
         }
 
-        crate::actions::sync()?;
+        refresh_local_cache()?;
     }
 
     Ok(())
@@ -1846,65 +1850,7 @@ pub fn edit(
             after_editor(
                 source,
                 &contents,
-                (|| {
-                    let (password, notes) = parse_editor(&contents);
-                    let password = password
-                        .map(|password| {
-                            crate::actions::encrypt(
-                                &password,
-                                entry.key.as_deref(),
-                                entry.org_id.as_deref(),
-                            )
-                        })
-                        .transpose()?;
-                    let notes = notes
-                        .map(|notes| {
-                            crate::actions::encrypt(
-                                &notes,
-                                entry.key.as_deref(),
-                                entry.org_id.as_deref(),
-                            )
-                        })
-                        .transpose()?;
-                    let mut history = entry.history.clone();
-                    let rbw::db::EntryData::Login {
-                        username: entry_username,
-                        password: entry_password,
-                        uris: entry_uris,
-                        totp: entry_totp,
-                    } = &entry.data
-                    else {
-                        unreachable!();
-                    };
-
-                    if let Some(prev_password) = entry_password.clone() {
-                        let new_history_entry = rbw::db::HistoryEntry {
-                            last_used_date: format!(
-                                "{}",
-                                humantime::format_rfc3339(
-                                    std::time::SystemTime::now()
-                                )
-                            ),
-                            password: prev_password,
-                        };
-                        history.insert(0, new_history_entry);
-                    }
-
-                    let data = rbw::db::EntryData::Login {
-                        username: entry_username.clone(),
-                        password,
-                        uris: entry_uris.clone(),
-                        totp: entry_totp.clone(),
-                    };
-                    put_cipher(
-                        &mut db,
-                        &entry,
-                        &data,
-                        &entry.fields,
-                        notes.as_deref(),
-                        &history,
-                    )
-                })(),
+                put_login_edit(&mut db, &entry, &contents),
             )
         }
         DecryptedData::SecureNote => {
@@ -1917,27 +1863,7 @@ pub fn edit(
             after_editor(
                 source,
                 &contents,
-                (|| {
-                    // prepend blank line to be parsed as pw by `parse_editor`
-                    let (_, notes) = parse_editor(&format!("\n{contents}\n"));
-                    let notes = notes
-                        .map(|notes| {
-                            crate::actions::encrypt(
-                                &notes,
-                                entry.key.as_deref(),
-                                entry.org_id.as_deref(),
-                            )
-                        })
-                        .transpose()?;
-                    put_cipher(
-                        &mut db,
-                        &entry,
-                        &rbw::db::EntryData::SecureNote {},
-                        &entry.fields,
-                        notes.as_deref(),
-                        &entry.history,
-                    )
-                })(),
+                put_note_edit(&mut db, &entry, &contents),
             )
         }
         _ => Err(anyhow::anyhow!(
@@ -1950,6 +1876,87 @@ fn is_revision_conflict(err: &anyhow::Error) -> bool {
     matches!(
         err.downcast_ref::<rbw::error::Error>(),
         Some(rbw::error::Error::CipherRevisionConflict)
+    )
+}
+
+fn put_login_edit(
+    db: &mut rbw::db::Db,
+    entry: &rbw::db::Entry,
+    contents: &str,
+) -> anyhow::Result<()> {
+    let (password, notes) = parse_editor(contents);
+    let password = password
+        .map(|password| {
+            crate::actions::encrypt(
+                &password,
+                entry.key.as_deref(),
+                entry.org_id.as_deref(),
+            )
+        })
+        .transpose()?;
+    let notes = notes
+        .map(|notes| {
+            crate::actions::encrypt(
+                &notes,
+                entry.key.as_deref(),
+                entry.org_id.as_deref(),
+            )
+        })
+        .transpose()?;
+    let mut history = entry.history.clone();
+    let rbw::db::EntryData::Login {
+        username: entry_username,
+        password: entry_password,
+        uris: entry_uris,
+        totp: entry_totp,
+    } = &entry.data
+    else {
+        unreachable!();
+    };
+
+    if let Some(prev_password) = entry_password.clone() {
+        let new_history_entry = rbw::db::HistoryEntry {
+            last_used_date: format!(
+                "{}",
+                humantime::format_rfc3339(std::time::SystemTime::now())
+            ),
+            password: prev_password,
+        };
+        history.insert(0, new_history_entry);
+    }
+
+    let data = rbw::db::EntryData::Login {
+        username: entry_username.clone(),
+        password,
+        uris: entry_uris.clone(),
+        totp: entry_totp.clone(),
+    };
+    put_cipher(db, entry, &data, &entry.fields, notes.as_deref(), &history)
+}
+
+fn put_note_edit(
+    db: &mut rbw::db::Db,
+    entry: &rbw::db::Entry,
+    contents: &str,
+) -> anyhow::Result<()> {
+    // prepend blank line to be parsed as pw by `parse_editor`
+    let (_, notes) = parse_editor(&format!("\n{contents}\n"));
+    let notes = notes
+        .map(|notes| {
+            crate::actions::encrypt(
+                &notes,
+                entry.key.as_deref(),
+                entry.org_id.as_deref(),
+            )
+        })
+        .transpose()?;
+    put_cipher(
+        db,
+        entry,
+        &rbw::db::EntryData::SecureNote {},
+        &entry.fields,
+        notes.as_deref(),
+        &entry.history,
     )
 }
 
@@ -2015,12 +2022,52 @@ fn after_editor<T>(
     result: anyhow::Result<T>,
 ) -> anyhow::Result<T> {
     result.map_err(|err| {
-        if persist_unsaved_after_edit(source) {
+        // Server write already landed. Do not stash, and do not tell
+        // a pipe caller to regenerate the value.
+        if is_local_cache_refresh_failed(&err) {
+            err
+        } else if persist_unsaved_after_edit(source) {
             err_with_unsaved(err, plaintext)
         } else {
-            err
+            err.context(
+                "the piped value was not written to disk; \
+                 re-run the producing command",
+            )
         }
     })
+}
+
+#[derive(Debug)]
+struct LocalCacheRefreshFailed;
+
+impl std::fmt::Display for LocalCacheRefreshFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "saved on the server, but local cache refresh failed; \
+             run `rbw sync` and do not retry the write",
+        )
+    }
+}
+
+impl std::error::Error for LocalCacheRefreshFailed {}
+
+fn refresh_local_cache() -> anyhow::Result<()> {
+    crate::actions::sync().context(LocalCacheRefreshFailed)
+}
+
+fn is_local_cache_refresh_failed(err: &anyhow::Error) -> bool {
+    // anyhow::Error::is sees a `.context(LocalCacheRefreshFailed)`
+    // wrapper; `chain()` downcast does not, because the concrete
+    // type is anyhow's private context object.
+    err.is::<LocalCacheRefreshFailed>()
+}
+
+pub fn exit_status(err: &anyhow::Error) -> i32 {
+    if is_local_cache_refresh_failed(err) {
+        2
+    } else {
+        1
+    }
 }
 
 fn put_cipher(
@@ -2054,12 +2101,10 @@ fn put_cipher(
     // Agent rebuilds the master-password-reprompt ciphertext set only
     // during sync, and only after the new vault is on disk. A failed
     // refresh here means disk and the in-memory set still match each
-    // other (both stale versus the server). Fail closed: the PUT
-    // succeeded, but this process cannot claim a consistent local view.
-    crate::actions::sync().context(
-        "edit saved on the server, but local cache refresh failed; \
-         run `rbw sync`",
-    )?;
+    // other (both stale versus the server). Fail closed with exit
+    // status 2: the PUT succeeded, but this process cannot claim a
+    // consistent local view. Callers must not retry the edit.
+    refresh_local_cache()?;
     *db = load_db()?;
     Ok(())
 }
@@ -4934,6 +4979,38 @@ mod test {
         .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("put failed"));
+        assert!(msg.contains("the piped value was not written to disk"));
         assert!(!msg.contains("plaintext you just typed"));
+    }
+
+    #[test]
+    fn test_after_editor_does_not_stash_after_server_save() {
+        let err = anyhow::anyhow!("network").context(LocalCacheRefreshFailed);
+        let err = after_editor::<()>(
+            rbw::edit::Source::Editor,
+            "typed-secret",
+            Err(err),
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("do not retry the write"));
+        assert!(!msg.contains("plaintext you just typed"));
+        assert_eq!(exit_status(&err), 2);
+        assert_eq!(exit_status(&anyhow::anyhow!("put failed")), 1);
+    }
+
+    #[test]
+    fn test_after_editor_pipe_does_not_rerun_after_server_save() {
+        let err = anyhow::anyhow!("network").context(LocalCacheRefreshFailed);
+        let err = after_editor::<()>(
+            rbw::edit::Source::Pipe,
+            "piped-secret",
+            Err(err),
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("do not retry the write"));
+        assert!(!msg.contains("the piped value was not written to disk"));
+        assert_eq!(exit_status(&err), 2);
     }
 }
